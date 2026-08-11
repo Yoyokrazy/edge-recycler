@@ -25,8 +25,8 @@ that automatic and safe, without you losing your tabs.
 - **Menu-bar readout.** Click the recycle icon to see Edge's current memory
   (summed `phys_footprint` across the whole Edge process tree — the same number
   Activity Monitor's *Memory* column shows), a **sparkline of recent history**,
-  a color status (🟢 Healthy / 🟠 Heavy / 🔴 Restart recommended), process count,
-  and system load.
+  a color status (🟢 Healthy / 🟠 Heavy / 🔴 Restart recommended), Edge's process
+  count, and its share of your Mac's total RAM.
 - **At-a-glance bar.** The menu-bar icon is a colored dot — 🟢 green (healthy),
   🟡 yellow (heavy), 🔴 red (restart recommended) — and shows the GB number
   alongside it when memory is elevated.

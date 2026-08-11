@@ -182,12 +182,6 @@ enum Sampler {
         }
         return snap
     }
-
-    static func loadAvg1() -> Double {
-        var l = [Double](repeating: 0, count: 3)
-        getloadavg(&l, 3)
-        return l[0]
-    }
 }
 
 // MARK: - Sparkline chart
@@ -673,8 +667,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
                          .foregroundColor: NSColor.labelColor]))
         headerItem.attributedTitle = head
 
-        contextItem.title = String(format: "%d Edge processes  \u{00B7}  load %.1f",
-                                    current.procs, Sampler.loadAvg1())
+        let totalGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
+        let totalGBInt = Int(totalGB.rounded())
+        if current.mainPid == nil {
+            contextItem.title = totalGB > 0 ? "Your Mac has \(totalGBInt) GB of memory" : ""
+        } else {
+            let pct = totalGB > 0 ? Int((gb / totalGB * 100).rounded()) : 0
+            contextItem.title = String(format: "%d Edge processes  \u{00B7}  %d%% of your %d GB of memory",
+                                       current.procs, pct, totalGBInt)
+        }
+        contextItem.toolTip = "Edge runs one process per tab/site plus helpers (GPU, network, extensions), so the count roughly tracks how much you have open. The percentage is Edge's total memory as a share of your Mac's installed RAM."
 
         // Caption below the chart: threshold mode + calibration status. (The
         // timeframe and line meanings are labeled directly on the chart now.)
