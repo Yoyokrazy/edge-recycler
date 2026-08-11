@@ -445,7 +445,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         menu.addItem(.separator())
 
         recycleItem = NSMenuItem(title: "Recycle Edge Now",
-                                 action: #selector(recycleNow), keyEquivalent: "r")
+                                 action: #selector(recycleNow), keyEquivalent: "")
         recycleItem.target = self
         menu.addItem(recycleItem)
 
