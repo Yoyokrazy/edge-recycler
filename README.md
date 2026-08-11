@@ -105,10 +105,14 @@ cd edge-recycler
 ./install.sh
 ```
 
-This builds the app, copies it to `~/Applications/Edge Recycler.app`, and
-registers a per-user **LaunchAgent** so it starts at login. Everything it
-touches is under your home directory (`~/Applications`, `~/Library/LaunchAgents`,
-`~/Library/Logs`) — nothing system-wide, no `sudo`.
+`install.sh` first checks prerequisites (macOS, `swiftc`; it warns if Edge
+isn't found), then builds the app, copies it to `~/Applications/Edge
+Recycler.app`, and registers a per-user **LaunchAgent** so it starts at login.
+Everything it touches is under your home directory (`~/Applications`,
+`~/Library/LaunchAgents`, `~/Library/Logs`) — nothing system-wide, no `sudo`.
+It's fully self-contained and machine-independent: no hardcoded paths, built
+from source on the target Mac (so it matches that Mac's architecture), and
+ad-hoc signed locally (no Apple Developer account, no notarization needed).
 
 First launch:
 
@@ -136,7 +140,9 @@ open "$(./build.sh | tail -1)"
 ./uninstall.sh
 ```
 
-Your Edge, its tabs, and its settings are never touched.
+Your Edge, its tabs, and its settings are never touched. This removes the app,
+the login agent, and logs; it prints where the learned-baseline data lives
+(`~/Library/Application Support/EdgeRecycler/`) if you want to delete that too.
 
 ## The notification permission model
 

@@ -13,13 +13,29 @@ LOG_OUT="$HOME/Library/Logs/edge-recycle.out.log"
 LOG_ERR="$HOME/Library/Logs/edge-recycle.err.log"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
+# 0. Preflight: verify prerequisites with clear, friendly errors.
+if [ "$(uname)" != "Darwin" ]; then
+    echo "Edge Recycler is macOS-only (detected: $(uname))." >&2
+    exit 1
+fi
+if ! command -v swiftc >/dev/null 2>&1; then
+    echo "The Swift compiler (swiftc) wasn't found." >&2
+    echo "Install the Xcode Command Line Tools, then re-run:" >&2
+    echo "    xcode-select --install" >&2
+    exit 1
+fi
+if [ ! -d "/Applications/Microsoft Edge.app" ] && [ ! -d "$HOME/Applications/Microsoft Edge.app" ]; then
+    echo "Note: Microsoft Edge wasn't found in /Applications. Installing anyway —"
+    echo "      Edge Recycler starts working automatically once Edge is present."
+fi
+
 # 1. Build (into $TMPDIR, outside any LaunchServices-scanned tree)
 APP_SRC="$(./build.sh | tail -n 1)"
 [ -d "$APP_SRC" ] || { echo "Build failed: '$APP_SRC' not found"; exit 1; }
 
 # 2. Stop any running instance / previously loaded agent
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-/usr/bin/pkill -x EdgeRecycler 2>/dev/null || true
+for p in $(pgrep -x EdgeRecycler 2>/dev/null || true); do kill "$p" 2>/dev/null || true; done
 sleep 1
 
 # 3. Install the app

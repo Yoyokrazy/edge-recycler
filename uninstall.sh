@@ -11,12 +11,15 @@ echo "==> Unloading login agent"
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 
 echo "==> Stopping app"
-/usr/bin/pkill -x EdgeRecycler 2>/dev/null || true
+for p in $(pgrep -x EdgeRecycler 2>/dev/null || true); do kill "$p" 2>/dev/null || true; done
 
 echo "==> Removing files"
 rm -f "$PLIST_DEST"
 rm -rf "$DEST"
+rm -f "$HOME/Library/Logs/edge-recycle."*.log 2>/dev/null || true
 
 echo "Done. (Your Edge and its settings are untouched.)"
 echo "Note: Edge Recycler may still appear under System Settings > General >"
 echo "Login Items & Extensions until next login; that entry clears itself."
+echo "Learned baseline data (if any) remains at:"
+echo "  ~/Library/Application Support/EdgeRecycler/  (delete to fully reset)"
