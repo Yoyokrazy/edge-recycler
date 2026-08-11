@@ -382,20 +382,36 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         case .yellow: symbol = "triangle.fill"; color = .systemYellow
         case .red:    symbol = "square.fill";   color = .systemRed
         }
+
+        // Render the shape + number as one attributed string so we can vertically
+        // center the symbol on the text's cap height. (Letting NSButton lay out a
+        // separate image + title leaves the symbol looking low / the digits high,
+        // because each is centered by different metrics.)
+        let font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        let result = NSMutableAttributedString()
+
         if let base = NSImage(systemSymbolName: symbol, accessibilityDescription: "Edge memory status") {
             let cfg = NSImage.SymbolConfiguration(pointSize: 11, weight: .medium)
                 .applying(NSImage.SymbolConfiguration(paletteColors: [color]))
-            let img = base.withSymbolConfiguration(cfg)
-            img?.isTemplate = false
-            button.image = img
-        } else {
-            button.image = nil
-            button.title = "\u{25CF}"
+            if let img = base.withSymbolConfiguration(cfg) {
+                img.isTemplate = false
+                let att = NSTextAttachment()
+                att.image = img
+                let h = img.size.height, w = img.size.width
+                att.bounds = CGRect(x: 0, y: (font.capHeight - h) / 2, width: w, height: h)
+                result.append(NSAttributedString(attachment: att))
+            }
         }
+
         // show the number in the bar only when things are elevated
-        button.imagePosition = .imageLeading
-        button.title = (st == .green || current.mainPid == nil) ? "" :
-            String(format: " %.1fGb", gb)
+        if !(st == .green || current.mainPid == nil) {
+            result.append(NSAttributedString(
+                string: String(format: "  %.1f GB", gb),
+                attributes: [.font: font, .foregroundColor: NSColor.labelColor]))
+        }
+
+        button.image = nil
+        button.attributedTitle = result
     }
 
     func menuWillOpen(_ menu: NSMenu) {
