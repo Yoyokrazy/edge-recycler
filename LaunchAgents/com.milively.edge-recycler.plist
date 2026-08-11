@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.milively.edge-recycler</string>
+
+    <!-- Launch the menu-bar app at login. The app itself owns the daily 8 AM
+         prompt, memory polling, and notifications; launchd only ensures it is
+         present in the login session. __APP_PATH__ is filled in by install.sh. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/open</string>
+        <string>__APP_PATH__</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>__LOG_OUT__</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_ERR__</string>
+</dict>
+</plist>
