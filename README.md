@@ -27,10 +27,9 @@ that automatic and safe, without you losing your tabs.
   Activity Monitor's *Memory* column shows), a **sparkline of recent history**,
   a color status (🟢 Healthy / 🟠 Heavy / 🔴 Restart recommended), process count,
   and system load.
-- **At-a-glance bar.** The menu-bar icon always reflects state as a colored
-  shape — 🟢 green circle (healthy), 🟡 yellow triangle (heavy), 🔴 red square
-  (restart recommended) — and shows the GB number alongside it when memory is
-  elevated.
+- **At-a-glance bar.** The menu-bar icon is a colored dot — 🟢 green (healthy),
+  🟡 yellow (heavy), 🔴 red (restart recommended) — and shows the GB number
+  alongside it when memory is elevated.
 - **Manual recycle.** *Recycle Edge Now* quits and reopens Edge on demand.
 - **Daily prompt.** At **8:00 AM** (or the soonest the Mac is awake after that,
   and only while Edge is running) it asks: **Restart Now / Delay 1 Hour / Skip
@@ -178,9 +177,11 @@ the learned history and re-learns from scratch (optionally restarting Edge
 first). While recalibrating, the threshold falls back to the default until a new
 baseline is established.
 
-The dropdown's chart shows this visually: the **dashed red line** is the current
+The dropdown's chart makes this visual: the **dashed red line** is the current
 restart threshold, the **dotted gray line** is the learned baseline, and the
-caption spells out the timeframe and both values.
+**x-axis span** (labeled at its right end) always covers at least the sustained
+restart duration — so if you require "10 min above threshold," the chart shows a
+~15-minute window and you can watch a streak build toward a nudge.
 
 ## Configuration
 
@@ -201,7 +202,6 @@ parentheses:
 | `triggerMinute`  | Minute of the daily prompt                                   | `0`      |
 | `pollSeconds`    | How often to sample Edge memory                              | `60`     |
 | `notifyCooldown` | Min seconds between high-memory notifications                | `3600`   |
-| `historyCount`   | Samples shown in the sparkline (120 × 60s ≈ 2 h)             | `120`    |
 | `chartTopGB`     | Top of the sparkline's y-axis (GB)                           | `8.0`    |
 | `calibrationSamples` | Samples before the baseline is trusted (~1 min each)     | `60`     |
 | `maxStoredSamples`   | Rolling cap on persisted samples (~3.5 days)             | `5000`   |

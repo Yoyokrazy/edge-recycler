@@ -48,7 +48,6 @@ enum Config {
     static var sustainMinutes: Double { doubleDefault("sustainMinutes", 10) }
     static var notifyCooldown: Double { doubleDefault("notifyCooldown", 3600) }
 
-    static var historyCount: Int { intDefault("historyCount", 120) }         // chart window (~2h at 60s)
     static var chartTopGB: Double { doubleDefault("chartTopGB", 8.0) }
 
     static var calibrationSamples: Int { intDefault("calibrationSamples", 60) } // ~1h before baseline is trusted
@@ -194,19 +193,21 @@ enum Sampler {
 // MARK: - Sparkline chart
 
 final class SparklineView: NSView {
-    var samples: [Double] = []
+    var samples: [(t: Double, v: Double)] = []   // timestamped (epoch seconds)
+    var windowSeconds: Double = 900               // x-axis span (time-calibrated)
+    var maxGapSeconds: Double = 180               // break the line across bigger gaps
     var warn: Double = 4.0
     var high: Double = 5.5
     var baseline: Double? = nil
 
     override var intrinsicContentSize: NSSize { NSSize(width: 240, height: 72) }
 
-    private func tick(_ text: String, _ x: CGFloat, _ y: CGFloat, align: NSTextAlignment = .left, color: NSColor = .tertiaryLabelColor) {
+    private func label(_ text: String, _ x: CGFloat, _ y: CGFloat, align: NSTextAlignment = .left, color: NSColor = .tertiaryLabelColor) {
         let p = NSMutableParagraphStyle(); p.alignment = align
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 8), .foregroundColor: color, .paragraphStyle: p]
         let s = NSAttributedString(string: text, attributes: attrs)
-        let w: CGFloat = 70
+        let w: CGFloat = 80
         let ox = align == .right ? x - w : x
         s.draw(in: CGRect(x: ox, y: y, width: w, height: 10))
     }
@@ -215,19 +216,27 @@ final class SparklineView: NSView {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
         let b = bounds.insetBy(dx: 10, dy: 12)
         let scale = max(Config.chartTopGB, high * 1.15)
+        let now = Date().timeIntervalSince1970
         func y(_ v: Double) -> CGFloat { b.minY + CGFloat(min(v, scale) / scale) * b.height }
-        func x(_ i: Int, _ n: Int) -> CGFloat {
-            n <= 1 ? b.minX : b.minX + CGFloat(i) / CGFloat(n - 1) * b.width
+        // right edge = now; left edge = windowSeconds ago
+        func x(_ t: Double) -> CGFloat {
+            let age = min(max(now - t, 0), windowSeconds)
+            return b.maxX - CGFloat(age / windowSeconds) * b.width
         }
 
-        // y-axis reference labels (top = scale, bottom = 0)
-        tick(String(format: "%.0f GB", scale), b.minX, b.maxY - 1)
-        tick("0", b.minX, b.minY - 10)
+        // y-axis reference labels (top = scale max, bottom = 0)
+        label(String(format: "%.0f GB", scale), b.minX, b.maxY - 1)
+        label("0", b.minX, b.minY - 10)
 
-        // zero baseline
+        // zero line
         ctx.setStrokeColor(NSColor.tertiaryLabelColor.cgColor)
         ctx.setLineWidth(0.5)
         ctx.move(to: CGPoint(x: b.minX, y: b.minY)); ctx.addLine(to: CGPoint(x: b.maxX, y: b.minY)); ctx.strokePath()
+
+        // x-axis time span, shown at the right end of the axis
+        let mins = windowSeconds / 60.0
+        let spanText = mins >= 90 ? String(format: "%.1fh", mins / 60.0) : String(format: "%dmin", Int(mins.rounded()))
+        label(spanText, b.maxX, b.minY - 10, align: .right)
 
         // learned baseline (dotted gray) with label
         if let base = baseline, base > 0 {
@@ -236,7 +245,7 @@ final class SparklineView: NSView {
             ctx.setLineWidth(1)
             ctx.move(to: CGPoint(x: b.minX, y: y(base))); ctx.addLine(to: CGPoint(x: b.maxX, y: y(base))); ctx.strokePath()
             ctx.setLineDash(phase: 0, lengths: [])
-            tick(String(format: "baseline %.1f", base), b.maxX, y(base) + 1, align: .right, color: .secondaryLabelColor)
+            label(String(format: "baseline %.1f", base), b.maxX, y(base) + 1, align: .right, color: .secondaryLabelColor)
         }
 
         // restart threshold (dashed red) with label
@@ -245,39 +254,45 @@ final class SparklineView: NSView {
         ctx.setLineWidth(1)
         ctx.move(to: CGPoint(x: b.minX, y: y(high))); ctx.addLine(to: CGPoint(x: b.maxX, y: y(high))); ctx.strokePath()
         ctx.setLineDash(phase: 0, lengths: [])
-        tick(String(format: "restart %.1f", high), b.maxX, y(high) + 1, align: .right, color: .systemRed)
+        label(String(format: "restart %.1f", high), b.maxX, y(high) + 1, align: .right, color: .systemRed)
 
-        guard samples.count > 1 else {
-            if let v = samples.last {
-                let c = colorFor(v)
+        // only plot samples within the window
+        let pts = samples.filter { now - $0.t <= windowSeconds }.sorted { $0.t < $1.t }
+        guard pts.count > 1 else {
+            if let last = pts.last {
+                let c = colorFor(last.v)
                 ctx.setFillColor(c.cgColor)
-                ctx.fillEllipse(in: CGRect(x: b.maxX - 2, y: y(v) - 2, width: 4, height: 4))
+                ctx.fillEllipse(in: CGRect(x: x(last.t) - 2, y: y(last.v) - 2, width: 4, height: 4))
             }
             return
         }
 
-        let n = samples.count
+        let col = colorFor(pts.last!.v)
+
+        // stroke the line, breaking across gaps longer than maxGapSeconds
         let line = CGMutablePath()
-        for (i, v) in samples.enumerated() {
-            let p = CGPoint(x: x(i, n), y: y(v))
-            if i == 0 { line.move(to: p) } else { line.addLine(to: p) }
+        var penDown = false
+        for (i, s) in pts.enumerated() {
+            let p = CGPoint(x: x(s.t), y: y(s.v))
+            if i > 0 && (s.t - pts[i - 1].t) > maxGapSeconds { penDown = false }
+            if penDown { line.addLine(to: p) } else { line.move(to: p); penDown = true }
         }
-
-        let latest = samples.last!
-        let col = colorFor(latest)
-
-        let fill = line.mutableCopy()!
-        fill.addLine(to: CGPoint(x: x(n - 1, n), y: b.minY))
-        fill.addLine(to: CGPoint(x: b.minX, y: b.minY))
-        fill.closeSubpath()
-        ctx.addPath(fill)
-        ctx.setFillColor(col.withAlphaComponent(0.15).cgColor)
-        ctx.fillPath()
-
         ctx.addPath(line)
         ctx.setStrokeColor(col.cgColor)
         ctx.setLineWidth(1.5)
         ctx.strokePath()
+
+        // subtle fill under the most recent contiguous segment
+        if let first = pts.first, let last = pts.last {
+            let fill = CGMutablePath()
+            fill.move(to: CGPoint(x: x(first.t), y: b.minY))
+            for s in pts { fill.addLine(to: CGPoint(x: x(s.t), y: y(s.v))) }
+            fill.addLine(to: CGPoint(x: x(last.t), y: b.minY))
+            fill.closeSubpath()
+            ctx.addPath(fill)
+            ctx.setFillColor(col.withAlphaComponent(0.12).cgColor)
+            ctx.fillPath()
+        }
     }
 
     func colorFor(_ v: Double) -> NSColor {
@@ -293,7 +308,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
     let menu = NSMenu()
     var timer: Timer?
 
-    var history: [Double] = []
+    var history: [(t: Double, v: Double)] = []   // timestamped in-session chart samples
     var current = EdgeSnapshot()
     var lastRecycled: Date?
     var lastNotified: Date?
@@ -338,6 +353,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
     }
     /// Yellow "heavy" level, guaranteed strictly below the restart threshold.
     var effectiveWarn: Double { min(max(effectiveHigh - 1.0, 3.0), effectiveHigh - 0.1) }
+
+    /// The chart's x-axis span. Always covers at least the sustained-restart
+    /// duration (with headroom) so you can see the whole "about to be nagged"
+    /// window, with a sensible floor so it's never too cramped to read.
+    var chartWindowMinutes: Double { max(Config.sustainMinutes * 1.5, 10) }
+    var chartWindowSeconds: Double { chartWindowMinutes * 60 }
 
     let kLastFiredDay = "lastFiredDay"
     let kSnoozeUntil  = "snoozeUntil"
@@ -493,6 +514,28 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         rebuildConfigMenus()
         refreshNotifyItem()
         refreshUI()
+        resizeChartToMenu()
+    }
+
+    /// Widen the chart to match the widest text item so it fills the menu's
+    /// horizontal space (menus size to their widest item; a custom view narrower
+    /// than the text items leaves an empty gap on the right).
+    func resizeChartToMenu() {
+        let font = NSFont.menuFont(ofSize: 0)
+        var maxW: CGFloat = 240
+        for it in menu.items {
+            if it.view != nil || it.isSeparatorItem { continue }
+            let tw: CGFloat
+            if let a = it.attributedTitle, a.length > 0 { tw = ceil(a.size().width) }
+            else { tw = ceil((it.title as NSString).size(withAttributes: [.font: font]).width) }
+            var total = tw + 44                       // left indent + margins
+            if it.submenu != nil { total += 14 }      // disclosure arrow
+            maxW = max(maxW, total)
+        }
+        maxW = min(maxW, 460)
+        if abs(sparkline.frame.width - maxW) > 0.5 {
+            sparkline.frame = NSRect(x: 0, y: 0, width: maxW, height: 72)
+        }
     }
 
     // ---- config submenus -------------------------------------------------
@@ -646,26 +689,26 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         contextItem.title = String(format: "%d Edge processes  \u{00B7}  load %.1f",
                                     current.procs, Sampler.loadAvg1())
 
-        // Chart caption: timeframe + what the reference lines mean + values.
-        let mins = Int((Double(max(history.count, 1)) * Config.pollSeconds) / 60.0)
-        let span = mins >= 90 ? String(format: "~%.1fh", Double(mins) / 60.0) : "\(mins) min"
-        let baseText: String
+        // Caption below the chart: threshold mode + calibration status. (The
+        // timeframe and line meanings are labeled directly on the chart now.)
+        let modeText = Config.thresholdMode == "auto" ? "auto" : "manual"
+        let statusText: String
         if let b = baseline {
-            baseText = String(format: "dotted = baseline %.1f", b)
+            statusText = String(format: "baseline %.1f GB", b)
         } else if current.mainPid == nil {
-            baseText = "learning baseline\u{2026}"
+            statusText = "learning baseline\u{2026}"
         } else {
             let need = max(Config.calibrationSamples - Store.shared.samples.count, 0)
-            baseText = "learning baseline (~\(need) min left)"
+            statusText = "learning baseline (~\(need) min left)"
         }
-        let mode = Config.thresholdMode == "auto" ? "auto" : "manual"
         captionItem.attributedTitle = NSAttributedString(
-            string: String(format: "Last %@  \u{00B7}  dashed = restart %.1f (%@)  \u{00B7}  %@",
-                           span, effectiveHigh, mode, baseText),
+            string: String(format: "restart at %.1f GB (%@)  \u{00B7}  %@", effectiveHigh, modeText, statusText),
             attributes: [.font: NSFont.systemFont(ofSize: 10),
                          .foregroundColor: NSColor.secondaryLabelColor])
 
         sparkline.samples = history
+        sparkline.windowSeconds = chartWindowSeconds
+        sparkline.maxGapSeconds = max(Config.pollSeconds * 2.5, 150)
         sparkline.warn = effectiveWarn
         sparkline.high = effectiveHigh
         sparkline.baseline = baseline
@@ -684,22 +727,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
 
     func updateBarButton(_ st: MemState, gb: Double) {
         guard let button = statusItem.button else { return }
-        let symbol: String
+        // Always a filled circle; only the color conveys state.
         let color: NSColor
         switch st {
-        case .green:  symbol = "circle.fill";   color = .systemGreen
-        case .yellow: symbol = "triangle.fill"; color = .systemYellow
-        case .red:    symbol = "square.fill";   color = .systemRed
+        case .green:  color = .systemGreen
+        case .yellow: color = .systemYellow
+        case .red:    color = .systemRed
         }
 
-        // Render the shape + number as one attributed string so we can vertically
-        // center the symbol on the text's cap height. (Letting NSButton lay out a
-        // separate image + title leaves the symbol looking low / the digits high,
+        // Render the circle + number as one attributed string so we can vertically
+        // center the glyph on the text's cap height. (Letting NSButton lay out a
+        // separate image + title leaves the dot looking low / the digits high,
         // because each is centered by different metrics.)
         let font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
         let result = NSMutableAttributedString()
 
-        if let base = NSImage(systemSymbolName: symbol, accessibilityDescription: "Edge memory status") {
+        if let base = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: "Edge memory status") {
             let cfg = NSImage.SymbolConfiguration(pointSize: 11, weight: .medium)
                 .applying(NSImage.SymbolConfiguration(paletteColors: [color]))
             if let img = base.withSymbolConfiguration(cfg) {
@@ -723,12 +766,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         button.attributedTitle = result
     }
 
-    func menuWillOpen(_ menu: NSMenu) {
+    func menuNeedsUpdate(_ menu: NSMenu) {
         sampleNow()   // make sure the dropdown shows a fresh reading
         updateStreak()
         rebuildConfigMenus()
         refreshUI()
         refreshNotifyItem()
+        resizeChartToMenu()
     }
 
     func menuDidClose(_ menu: NSMenu) {
@@ -746,8 +790,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
     func sampleNow() {
         current = Sampler.snapshot()
         if current.mainPid != nil {
-            history.append(current.gb)
-            if history.count > Config.historyCount { history.removeFirst(history.count - Config.historyCount) }
+            let now = Date().timeIntervalSince1970
+            history.append((now, current.gb))
+            // Keep a little more than the visible window so the line reaches the
+            // left edge; drop anything older, and hard-cap count as a safety net.
+            let cutoff = now - chartWindowSeconds - Config.pollSeconds
+            history.removeAll { $0.t < cutoff }
+            if history.count > 2000 { history.removeFirst(history.count - 2000) }
         }
     }
 
