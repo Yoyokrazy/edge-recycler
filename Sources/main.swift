@@ -22,9 +22,9 @@ import UserNotifications
 //    --restore-last-session. It NEVER force-kills.
 //
 // Tunable at runtime without recompiling, e.g.:
-//    defaults write com.edgerecycler.app highGB        -float 6.0
+//    defaults write com.edgerecycler.app thresholdMode  -string manual
+//    defaults write com.edgerecycler.app manualHighGB   -float 6.0
 //    defaults write com.edgerecycler.app sustainMinutes -int 15
-//    defaults write com.edgerecycler.app triggerHour   -int 8
 // ============================================================================
 
 // MARK: - Config
@@ -33,14 +33,26 @@ enum Config {
     static var triggerHour: Int  { intDefault("triggerHour", 8) }
     static var triggerMinute: Int { intDefault("triggerMinute", 0) }
     static var pollSeconds: Double { doubleDefault("pollSeconds", 60) }
-    static var warnGB: Double { doubleDefault("warnGB", 4.0) }
-    static var highGB: Double { doubleDefault("highGB", 5.5) }
-    /// How long Edge must stay continuously at/above highGB before we alert.
-    /// Filters out momentary spikes (e.g. loading a heavy page).
+
+    // Restart-threshold model. In "auto" mode the threshold is learned from a
+    // rolling baseline (median) of observed usage; in "manual" mode the user
+    // picks an absolute GB value.
+    static var thresholdMode: String { UserDefaults.standard.string(forKey: "thresholdMode") ?? "auto" }
+    static var manualHighGB: Double { doubleDefault("manualHighGB", 5.5) }
+    static var autoMarginGB: Double { doubleDefault("autoMarginGB", 2.0) }   // auto threshold = baseline + margin
+    static var autoFloorGB: Double { doubleDefault("autoFloorGB", 4.5) }     // …clamped to this range
+    static var autoCeilGB: Double { doubleDefault("autoCeilGB", 12.0) }
+    static var defaultHighGB: Double { doubleDefault("defaultHighGB", 5.5) } // used until a baseline exists
+
+    /// Edge must stay at/above the threshold this long before we alert.
     static var sustainMinutes: Double { doubleDefault("sustainMinutes", 10) }
     static var notifyCooldown: Double { doubleDefault("notifyCooldown", 3600) }
-    static var historyCount: Int { intDefault("historyCount", 120) }
+
+    static var historyCount: Int { intDefault("historyCount", 120) }         // chart window (~2h at 60s)
     static var chartTopGB: Double { doubleDefault("chartTopGB", 8.0) }
+
+    static var calibrationSamples: Int { intDefault("calibrationSamples", 60) } // ~1h before baseline is trusted
+    static var maxStoredSamples: Int { intDefault("maxStoredSamples", 5000) }    // ~3.5 days at 60s
 
     static func intDefault(_ k: String, _ d: Int) -> Int {
         UserDefaults.standard.object(forKey: k) != nil ? UserDefaults.standard.integer(forKey: k) : d
@@ -48,6 +60,78 @@ enum Config {
     static func doubleDefault(_ k: String, _ d: Double) -> Double {
         UserDefaults.standard.object(forKey: k) != nil ? UserDefaults.standard.double(forKey: k) : d
     }
+    static func set(_ k: String, _ v: Double) { UserDefaults.standard.set(v, forKey: k) }
+    static func set(_ k: String, _ v: String) { UserDefaults.standard.set(v, forKey: k) }
+}
+
+// MARK: - Persistent sample store (baseline learning)
+
+struct Sample: Codable { let t: Double; let gb: Double }
+
+/// Persists memory samples across launches so we can learn a baseline (median)
+/// usage level and derive a sensible restart threshold. Stored as JSON under
+/// ~/Library/Application Support/EdgeRecycler/state.json.
+final class Store {
+    static let shared = Store()
+    private(set) var samples: [Sample] = []
+    private(set) var installDate = Date().timeIntervalSince1970
+    private(set) var existedAtLoad = false
+    private var loaded = false
+
+    private let url: URL = {
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/EdgeRecycler", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("state.json")
+    }()
+
+    private struct Persisted: Codable { var installDate: Double; var samples: [Sample] }
+
+    func load() {
+        guard !loaded else { return }
+        loaded = true
+        if let data = try? Data(contentsOf: url),
+           let p = try? JSONDecoder().decode(Persisted.self, from: data) {
+            existedAtLoad = true
+            installDate = p.installDate
+            samples = p.samples
+        } else {
+            installDate = Date().timeIntervalSince1970
+            save()
+        }
+    }
+
+    func append(gb: Double) {
+        samples.append(Sample(t: Date().timeIntervalSince1970, gb: gb))
+        if samples.count > Config.maxStoredSamples {
+            samples.removeFirst(samples.count - Config.maxStoredSamples)
+        }
+        save()
+    }
+
+    func save() {
+        if let data = try? JSONEncoder().encode(Persisted(installDate: installDate, samples: samples)) {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    /// Median GB across stored samples, or nil if we don't yet have `min` of them.
+    func baseline(min: Int) -> Double? {
+        let need = Swift.max(min, 1)          // never index into an empty array
+        guard samples.count >= need else { return nil }
+        let v = samples.map { $0.gb }.sorted()
+        let m = v.count / 2
+        return v.count % 2 == 0 ? (v[m - 1] + v[m]) / 2 : v[m]
+    }
+
+    /// Discard learned history so the baseline is re-learned from scratch.
+    func reset() {
+        samples.removeAll()
+        installDate = Date().timeIntervalSince1970
+        save()
+    }
+
+    var calibrated: Bool { samples.count >= Config.calibrationSamples }
 }
 
 enum MemState { case green, yellow, red }
@@ -111,38 +195,59 @@ enum Sampler {
 
 final class SparklineView: NSView {
     var samples: [Double] = []
-    var warn = Config.warnGB
-    var high = Config.highGB
+    var warn: Double = 4.0
+    var high: Double = 5.5
+    var baseline: Double? = nil
 
-    override var intrinsicContentSize: NSSize { NSSize(width: 240, height: 66) }
+    override var intrinsicContentSize: NSSize { NSSize(width: 240, height: 72) }
+
+    private func tick(_ text: String, _ x: CGFloat, _ y: CGFloat, align: NSTextAlignment = .left, color: NSColor = .tertiaryLabelColor) {
+        let p = NSMutableParagraphStyle(); p.alignment = align
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 8), .foregroundColor: color, .paragraphStyle: p]
+        let s = NSAttributedString(string: text, attributes: attrs)
+        let w: CGFloat = 70
+        let ox = align == .right ? x - w : x
+        s.draw(in: CGRect(x: ox, y: y, width: w, height: 10))
+    }
 
     override func draw(_ dirty: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        let b = bounds.insetBy(dx: 10, dy: 10)
+        let b = bounds.insetBy(dx: 10, dy: 12)
         let scale = max(Config.chartTopGB, high * 1.15)
         func y(_ v: Double) -> CGFloat { b.minY + CGFloat(min(v, scale) / scale) * b.height }
         func x(_ i: Int, _ n: Int) -> CGFloat {
             n <= 1 ? b.minX : b.minX + CGFloat(i) / CGFloat(n - 1) * b.width
         }
 
-        // baseline
+        // y-axis reference labels (top = scale, bottom = 0)
+        tick(String(format: "%.0f GB", scale), b.minX, b.maxY - 1)
+        tick("0", b.minX, b.minY - 10)
+
+        // zero baseline
         ctx.setStrokeColor(NSColor.tertiaryLabelColor.cgColor)
         ctx.setLineWidth(0.5)
-        ctx.move(to: CGPoint(x: b.minX, y: b.minY))
-        ctx.addLine(to: CGPoint(x: b.maxX, y: b.minY))
-        ctx.strokePath()
+        ctx.move(to: CGPoint(x: b.minX, y: b.minY)); ctx.addLine(to: CGPoint(x: b.maxX, y: b.minY)); ctx.strokePath()
 
-        // high-threshold dashed line
+        // learned baseline (dotted gray) with label
+        if let base = baseline, base > 0 {
+            ctx.setLineDash(phase: 0, lengths: [1, 3])
+            ctx.setStrokeColor(NSColor.secondaryLabelColor.withAlphaComponent(0.7).cgColor)
+            ctx.setLineWidth(1)
+            ctx.move(to: CGPoint(x: b.minX, y: y(base))); ctx.addLine(to: CGPoint(x: b.maxX, y: y(base))); ctx.strokePath()
+            ctx.setLineDash(phase: 0, lengths: [])
+            tick(String(format: "baseline %.1f", base), b.maxX, y(base) + 1, align: .right, color: .secondaryLabelColor)
+        }
+
+        // restart threshold (dashed red) with label
         ctx.setLineDash(phase: 0, lengths: [3, 3])
-        ctx.setStrokeColor(NSColor.systemRed.withAlphaComponent(0.55).cgColor)
+        ctx.setStrokeColor(NSColor.systemRed.withAlphaComponent(0.6).cgColor)
         ctx.setLineWidth(1)
-        ctx.move(to: CGPoint(x: b.minX, y: y(high)))
-        ctx.addLine(to: CGPoint(x: b.maxX, y: y(high)))
-        ctx.strokePath()
+        ctx.move(to: CGPoint(x: b.minX, y: y(high))); ctx.addLine(to: CGPoint(x: b.maxX, y: y(high))); ctx.strokePath()
         ctx.setLineDash(phase: 0, lengths: [])
+        tick(String(format: "restart %.1f", high), b.maxX, y(high) + 1, align: .right, color: .systemRed)
 
         guard samples.count > 1 else {
-            // draw a single dot if we only have one reading
             if let v = samples.last {
                 let c = colorFor(v)
                 ctx.setFillColor(c.cgColor)
@@ -161,7 +266,6 @@ final class SparklineView: NSView {
         let latest = samples.last!
         let col = colorFor(latest)
 
-        // fill under the curve
         let fill = line.mutableCopy()!
         fill.addLine(to: CGPoint(x: x(n - 1, n), y: b.minY))
         fill.addLine(to: CGPoint(x: b.minX, y: b.minY))
@@ -170,7 +274,6 @@ final class SparklineView: NSView {
         ctx.setFillColor(col.withAlphaComponent(0.15).cgColor)
         ctx.fillPath()
 
-        // the line
         ctx.addPath(line)
         ctx.setStrokeColor(col.cgColor)
         ctx.setLineWidth(1.5)
@@ -194,19 +297,47 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
     var current = EdgeSnapshot()
     var lastRecycled: Date?
     var lastNotified: Date?
-    var redSince: Date?           // when Edge first went (and stayed) at/above highGB
+    var notificationPending = false  // guards against duplicate in-flight notifications
+    var redSince: Date?           // when Edge first went (and stayed) at/above the threshold
     var isPrompting = false
     var isRecycling = false
     var didRequestAuth = false    // request notification permission only once, in-context
 
     let sparkline = SparklineView()
     var headerItem = NSMenuItem()
+    var captionItem = NSMenuItem()
     var contextItem = NSMenuItem()
     var recycleItem = NSMenuItem()
     var lastItem = NSMenuItem()
     var notifyItem = NSMenuItem()
+    var thresholdMenu = NSMenu()
+    var sustainMenu = NSMenu()
 
     var hasBundle: Bool { Bundle.main.bundleIdentifier != nil }
+
+    // ---- learned threshold model ----------------------------------------
+
+    /// Rolling median of observed usage, once we have enough samples.
+    var baseline: Double? { Store.shared.baseline(min: Config.calibrationSamples) }
+    var calibrated: Bool { Store.shared.calibrated }
+
+    /// The GB level at which a sustained stay triggers a restart prompt.
+    /// Auto = baseline + margin (clamped); until a baseline exists, a safe default.
+    /// Always returns a finite, sanely-bounded value regardless of defaults input.
+    var effectiveHigh: Double {
+        let raw: Double
+        if Config.thresholdMode == "manual" {
+            raw = Config.manualHighGB
+        } else if let b = baseline {
+            raw = min(max(b + Config.autoMarginGB, Config.autoFloorGB), Config.autoCeilGB)
+        } else {
+            raw = Config.defaultHighGB
+        }
+        guard raw.isFinite, raw > 0 else { return 5.5 }   // bulletproof fallback
+        return min(max(raw, 1.0), 64.0)
+    }
+    /// Yellow "heavy" level, guaranteed strictly below the restart threshold.
+    var effectiveWarn: Double { min(max(effectiveHigh - 1.0, 3.0), effectiveHigh - 0.1) }
 
     let kLastFiredDay = "lastFiredDay"
     let kSnoozeUntil  = "snoozeUntil"
@@ -240,6 +371,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
     // ---- lifecycle -------------------------------------------------------
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        Store.shared.load()
         buildMenu()
         setupNotifications()
         seedInitialFireDayIfNeeded()
@@ -252,6 +384,23 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         RunLoop.main.add(t, forMode: .common)
         timer = t
         tick()
+        maybeOnboard()
+    }
+
+    /// One-time welcome on first install: explain the app and offer to restart
+    /// Edge now so baseline learning starts from a clean slate.
+    func maybeOnboard() {
+        guard !UserDefaults.standard.bool(forKey: "didOnboard") else { return }
+        UserDefaults.standard.set(true, forKey: "didOnboard")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            NSApp.activate(ignoringOtherApps: true)
+            let a = NSAlert()
+            a.messageText = "Welcome to Edge Recycler"
+            a.informativeText = "It watches how much memory Microsoft Edge uses and can restart it — restoring your tabs — when it bloats.\n\nFor about the next hour it will learn your normal usage (a baseline) and then set a smart restart level automatically. You can adjust it anytime from the menu.\n\nStart from a clean slate by restarting Edge now?"
+            a.addButton(withTitle: "Restart Edge Now")
+            a.addButton(withTitle: "Not Now")
+            if a.runModal() == .alertFirstButtonReturn { self.restartForCleanBaseline() }
+        }
     }
 
     /// If the app starts *after* today's trigger time (e.g. a mid-day install or
@@ -281,9 +430,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         menu.addItem(headerItem)
 
         let chartItem = NSMenuItem()
-        sparkline.frame = NSRect(x: 0, y: 0, width: 240, height: 66)
+        sparkline.frame = NSRect(x: 0, y: 0, width: 240, height: 72)
         chartItem.view = sparkline
         menu.addItem(chartItem)
+
+        captionItem.isEnabled = false
+        captionItem.attributedTitle = NSAttributedString(string: " ",
+            attributes: [.font: NSFont.systemFont(ofSize: 10)])
+        menu.addItem(captionItem)
 
         contextItem.isEnabled = false
         menu.addItem(contextItem)
@@ -294,6 +448,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
                                  action: #selector(recycleNow), keyEquivalent: "r")
         recycleItem.target = self
         menu.addItem(recycleItem)
+
+        // Restart-threshold submenu
+        let threshItem = NSMenuItem(title: "Restart when above", action: nil, keyEquivalent: "")
+        threshItem.submenu = thresholdMenu
+        menu.addItem(threshItem)
+
+        // Sustained-duration submenu
+        let sustainItem = NSMenuItem(title: "Sustained for", action: nil, keyEquivalent: "")
+        sustainItem.submenu = sustainMenu
+        menu.addItem(sustainItem)
+
+        let recal = NSMenuItem(title: "Recalibrate Baseline\u{2026}",
+                               action: #selector(recalibrate), keyEquivalent: "")
+        recal.target = self
+        menu.addItem(recal)
 
         let sched = NSMenuItem(title: schedLabel(), action: nil, keyEquivalent: "")
         sched.isEnabled = false
@@ -321,8 +490,128 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         menu.addItem(quit)
 
         statusItem.menu = menu
+        rebuildConfigMenus()
         refreshNotifyItem()
         refreshUI()
+    }
+
+    // ---- config submenus -------------------------------------------------
+
+    let thresholdPresets: [Double] = [4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 8.0]
+    let sustainPresets: [Double] = [5, 10, 15, 20, 30, 45, 60]
+
+    func rebuildConfigMenus() {
+        thresholdMenu.removeAllItems()
+        let auto = NSMenuItem(title: String(format: "Auto — learned (%.1f GB)", effectiveHigh),
+                              action: #selector(setThresholdAuto), keyEquivalent: "")
+        auto.target = self
+        auto.state = (Config.thresholdMode == "auto") ? .on : .off
+        thresholdMenu.addItem(auto)
+        thresholdMenu.addItem(.separator())
+        for v in thresholdPresets {
+            let it = NSMenuItem(title: String(format: "%.1f GB", v),
+                                action: #selector(setThresholdPreset(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = v
+            it.state = (Config.thresholdMode == "manual" && abs(Config.manualHighGB - v) < 0.001) ? .on : .off
+            thresholdMenu.addItem(it)
+        }
+        thresholdMenu.addItem(.separator())
+        let custom = NSMenuItem(title: "Custom\u{2026}", action: #selector(setThresholdCustom), keyEquivalent: "")
+        custom.target = self
+        let isPreset = thresholdPresets.contains { abs($0 - Config.manualHighGB) < 0.001 }
+        custom.state = (Config.thresholdMode == "manual" && !isPreset) ? .on : .off
+        thresholdMenu.addItem(custom)
+
+        sustainMenu.removeAllItems()
+        for m in sustainPresets {
+            let it = NSMenuItem(title: "\(Int(m)) min",
+                                action: #selector(setSustainPreset(_:)), keyEquivalent: "")
+            it.target = self
+            it.representedObject = m
+            it.state = (abs(Config.sustainMinutes - m) < 0.001) ? .on : .off
+            sustainMenu.addItem(it)
+        }
+    }
+
+    @objc func setThresholdAuto() { Config.set("thresholdMode", "auto"); afterThresholdChange() }
+
+    @objc func setThresholdPreset(_ item: NSMenuItem) {
+        guard let v = item.representedObject as? Double else { return }
+        Config.set("thresholdMode", "manual"); Config.set("manualHighGB", v); afterThresholdChange()
+    }
+
+    @objc func setThresholdCustom() {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "Custom restart threshold"
+        a.informativeText = "Prompt to restart when Edge stays above this many GB for the sustained duration. Enter a value between 1 and 64."
+        let tf = NSTextField(frame: NSRect(x: 0, y: 0, width: 200, height: 24))
+        tf.stringValue = String(format: "%.1f", effectiveHigh)
+        a.accessoryView = tf
+        a.addButton(withTitle: "Set"); a.addButton(withTitle: "Cancel")
+        if a.runModal() == .alertFirstButtonReturn,
+           let v = Double(tf.stringValue.trimmingCharacters(in: .whitespaces)),
+           v.isFinite, v >= 1.0, v <= 64.0 {
+            Config.set("thresholdMode", "manual"); Config.set("manualHighGB", v); afterThresholdChange()
+        }
+    }
+
+    @objc func setSustainPreset(_ item: NSMenuItem) {
+        guard let m = item.representedObject as? Double else { return }
+        Config.set("sustainMinutes", m); afterSustainChange()
+    }
+
+    /// Threshold changed → the streak must be re-judged against the new level.
+    func afterThresholdChange() {
+        redSince = nil
+        sampleNow()
+        updateStreak()
+        rebuildConfigMenus()
+        refreshUI()
+    }
+
+    /// Only the sustained-duration changed → preserve any ongoing streak so an
+    /// already-high Edge isn't given a fresh grace period. updateStreak() keeps
+    /// redSince when still red and clears it if Edge has since dropped/exited.
+    func afterSustainChange() {
+        sampleNow()
+        updateStreak()
+        rebuildConfigMenus()
+        refreshUI()
+    }
+
+    /// Clear the learned baseline and restart Edge so learning begins from a
+    /// clean slate. Shared by first-run onboarding and recalibration.
+    func restartForCleanBaseline() {
+        Store.shared.reset()
+        redSince = nil
+        history.removeAll()
+        recycleEdge()          // async; re-samples + refreshes on completion
+        rebuildConfigMenus()
+        refreshUI()
+    }
+
+    /// Let the user throw away the learned baseline and re-learn from scratch —
+    /// useful after their usage habits change, or to reset a skewed baseline.
+    /// Optionally restarts Edge first so learning starts from a clean slate.
+    @objc func recalibrate() {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "Recalibrate baseline?"
+        a.informativeText = "This clears the learned memory history and re-learns your normal usage over about the next hour. While it re-learns, the restart threshold falls back to its default.\n\nRestart Edge now for the cleanest baseline?"
+        a.addButton(withTitle: "Restart Edge & Recalibrate")
+        a.addButton(withTitle: "Recalibrate Only")
+        a.addButton(withTitle: "Cancel")
+        switch a.runModal() {
+        case .alertFirstButtonReturn:
+            restartForCleanBaseline()
+        case .alertSecondButtonReturn:
+            Store.shared.reset()
+            afterThresholdChange()
+        default:
+            break
+        }
     }
 
     func schedLabel() -> String {
@@ -333,7 +622,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
     }
 
     func state(_ gb: Double) -> MemState {
-        gb >= Config.highGB ? .red : (gb >= Config.warnGB ? .yellow : .green)
+        gb >= effectiveHigh ? .red : (gb >= effectiveWarn ? .yellow : .green)
     }
 
     func refreshUI() {
@@ -357,9 +646,29 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         contextItem.title = String(format: "%d Edge processes  \u{00B7}  load %.1f",
                                     current.procs, Sampler.loadAvg1())
 
+        // Chart caption: timeframe + what the reference lines mean + values.
+        let mins = Int((Double(max(history.count, 1)) * Config.pollSeconds) / 60.0)
+        let span = mins >= 90 ? String(format: "~%.1fh", Double(mins) / 60.0) : "\(mins) min"
+        let baseText: String
+        if let b = baseline {
+            baseText = String(format: "dotted = baseline %.1f", b)
+        } else if current.mainPid == nil {
+            baseText = "learning baseline\u{2026}"
+        } else {
+            let need = max(Config.calibrationSamples - Store.shared.samples.count, 0)
+            baseText = "learning baseline (~\(need) min left)"
+        }
+        let mode = Config.thresholdMode == "auto" ? "auto" : "manual"
+        captionItem.attributedTitle = NSAttributedString(
+            string: String(format: "Last %@  \u{00B7}  dashed = restart %.1f (%@)  \u{00B7}  %@",
+                           span, effectiveHigh, mode, baseText),
+            attributes: [.font: NSFont.systemFont(ofSize: 10),
+                         .foregroundColor: NSColor.secondaryLabelColor])
+
         sparkline.samples = history
-        sparkline.warn = Config.warnGB
-        sparkline.high = Config.highGB
+        sparkline.warn = effectiveWarn
+        sparkline.high = effectiveHigh
+        sparkline.baseline = baseline
         sparkline.needsDisplay = true
 
         recycleItem.title = isRecycling ? "Recycling\u{2026}" : "Recycle Edge Now"
@@ -416,6 +725,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
 
     func menuWillOpen(_ menu: NSMenu) {
         sampleNow()   // make sure the dropdown shows a fresh reading
+        updateStreak()
+        rebuildConfigMenus()
         refreshUI()
         refreshNotifyItem()
     }
@@ -434,18 +745,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
 
     func sampleNow() {
         current = Sampler.snapshot()
-        // Maintain the sustained-high streak here (not only in checkHighMemory),
-        // so every sample path — timer, menu open, post-recycle — keeps redSince
-        // consistent. A dropped/low sample or a missing Edge always resets it,
-        // which prevents a stale streak from firing an immediate alert.
         if current.mainPid != nil {
             history.append(current.gb)
             if history.count > Config.historyCount { history.removeFirst(history.count - Config.historyCount) }
-            if state(current.gb) == .red {
-                if redSince == nil { redSince = Date() }
-            } else {
-                redSince = nil
-            }
+        }
+    }
+
+    /// Evaluate the continuous "at/above threshold" streak. Must be called AFTER
+    /// any Store.append that could shift the learned threshold, so the streak is
+    /// judged against the same threshold the UI shows. A non-red or absent-Edge
+    /// sample always clears the streak, preventing a stale start time from firing.
+    func updateStreak() {
+        if current.mainPid != nil, state(current.gb) == .red {
+            if redSince == nil { redSince = Date() }
         } else {
             redSince = nil
         }
@@ -453,23 +765,30 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
 
     @objc func tick() {
         sampleNow()
+        // Persist one baseline sample per poll — but not while recycling, when
+        // Edge memory is transitional and would skew the learned baseline.
+        if current.mainPid != nil && !isRecycling { Store.shared.append(gb: current.gb) }
+        updateStreak()   // after append, so it uses the freshly-updated threshold
         refreshUI()
         checkHighMemory()
         checkSchedule()
     }
 
     func checkHighMemory() {
-        // redSince is maintained by sampleNow(). Alert only once Edge has been
-        // continuously at/above highGB for sustainMinutes, respecting cooldown,
-        // and only mark lastNotified when the notification actually posts.
-        guard current.mainPid != nil, let since = redSince else { return }
+        // Alert only once Edge is currently red AND has been continuously so for
+        // sustainMinutes, respecting the cooldown, with no notification already in
+        // flight. lastNotified is set only when a notification actually posts.
+        guard current.mainPid != nil, state(current.gb) == .red, let since = redSince else { return }
         let now = Date()
         guard now.timeIntervalSince(since) >= Config.sustainMinutes * 60 else { return }
         if let last = lastNotified, now.timeIntervalSince(last) < Config.notifyCooldown { return }
+        if notificationPending { return }
+        notificationPending = true
         let mins = Int(now.timeIntervalSince(since) / 60)
         let gb = current.gb
         postHighMemoryNotification(gb: gb, sustainedMinutes: mins) { ok in
-            if ok { self.lastNotified = Date() }   // completion is delivered on main
+            self.notificationPending = false          // completion is delivered on main
+            if ok { self.lastNotified = Date() }
         }
     }
 
@@ -657,7 +976,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
     func postHighMemoryNotification(gb: Double, sustainedMinutes: Int, completion: ((Bool) -> Void)? = nil) {
         notify(title: "Edge is using a lot of memory",
                body: String(format: "Edge has been above %.1f GB for %d min (now %.1f GB). Restart to free it up?",
-                            Config.highGB, sustainedMinutes, gb),
+                            effectiveHigh, sustainedMinutes, gb),
                offerRecycle: true, completion: completion)
     }
 

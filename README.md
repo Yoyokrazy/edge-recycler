@@ -38,11 +38,24 @@ that automatic and safe, without you losing your tabs.
   (a mid-day install, or a morning login past 8 AM with a freshly-launched
   Edge), it skips today and resumes on the next scheduled day — use *Recycle
   Edge Now* if you want it immediately.
-- **High-memory notification.** If Edge stays **at or above the *high* threshold
-  for a sustained period** (10 minutes by default — not a momentary spike), it
-  posts a **native macOS notification** with a **Restart Edge Now** button.
-  Rate-limited to at most once an hour so it never spams. A brief spike from
-  loading a heavy page won't trigger it; only genuinely stuck-high memory does.
+- **Learned baseline + smart threshold.** The app persistently records memory
+  samples and computes a **rolling baseline** (median) of your normal usage. In
+  **Auto** mode the restart threshold is set from that baseline (baseline + a
+  margin, clamped to a sane range), so "too high" is relative to *your* habits,
+  not a hardcoded guess. You can also switch to a **manual** GB value.
+- **First-run calibration.** On first install it welcomes you and offers to
+  restart Edge for a clean starting point, then learns your baseline over the
+  next ~hour. Until it has enough data it uses a safe default threshold. You can
+  re-learn anytime with **Recalibrate Baseline…** (e.g. after your habits
+  change) — it clears the history and optionally restarts Edge for a clean slate.
+- **Configurable from the menu.** *Restart when above ▸* (Auto or a GB preset or
+  a custom value) and *Sustained for ▸* (minutes) let you tune exactly when it
+  nudges you — no config files needed.
+- **High-memory notification.** If Edge stays **at or above the restart
+  threshold for a sustained period** (10 minutes by default — not a momentary
+  spike), it posts a **native macOS notification** with a **Restart Edge Now**
+  button. Rate-limited to at most once an hour. A brief spike from loading a
+  heavy page won't trigger it; only genuinely stuck-high memory does.
 - **Native notifications, done right.** Permission is requested **in context**
   the first time you open the menu — never at launch — so the macOS *Allow*
   prompt appears and sticks. The menu shows notification status and, if you've
@@ -143,36 +156,69 @@ silently never work:
 
 ---
 
+## How the restart threshold is decided
+
+Rather than hardcoding "restart at X GB," the app **learns your baseline** and
+sets the threshold relative to it:
+
+- Every poll, the current Edge memory is appended to a persistent log
+  (`~/Library/Application Support/EdgeRecycler/state.json`, a rolling ~3.5-day
+  window).
+- The **baseline** is the *median* of those samples — a robust estimate of your
+  normal usage that ignores brief spikes.
+- In **Auto** mode the restart threshold = `baseline + autoMarginGB`, clamped to
+  `[autoFloorGB, autoCeilGB]`. Until there are enough samples to trust
+  (`calibrationSamples`, ~1 h), it uses `defaultHighGB`.
+- In **Manual** mode you pick an absolute GB value (menu presets or *Custom…*).
+- A restart is only *nudged* when memory stays at/above the threshold for
+  `sustainMinutes` continuously — momentary spikes are ignored.
+
+If your usage habits change, **Recalibrate Baseline…** in the menu throws away
+the learned history and re-learns from scratch (optionally restarting Edge
+first). While recalibrating, the threshold falls back to the default until a new
+baseline is established.
+
+The dropdown's chart shows this visually: the **dashed red line** is the current
+restart threshold, the **dotted gray line** is the learned baseline, and the
+caption spells out the timeframe and both values.
+
 ## Configuration
 
-Thresholds and timing are read at runtime from `defaults`, so you can tune them
-without recompiling. Defaults in parentheses:
+Everything below is read at runtime from `defaults`, and the common ones have
+menu controls (*Restart when above ▸*, *Sustained for ▸*). Defaults in
+parentheses:
 
-| Key              | Meaning                                             | Default |
-| ---------------- | --------------------------------------------------- | ------- |
-| `warnGB`         | Yellow "Heavy" threshold (GB)                       | `4.0`   |
-| `highGB`         | Red threshold (GB)                                  | `5.5`   |
-| `sustainMinutes` | Minutes Edge must stay ≥ `highGB` before alerting   | `10`    |
-| `triggerHour`    | Hour of the daily prompt (0–23)                     | `8`     |
-| `triggerMinute`  | Minute of the daily prompt                          | `0`     |
-| `pollSeconds`    | How often to sample Edge memory                     | `60`    |
-| `notifyCooldown` | Min seconds between high-memory notifications       | `3600`  |
-| `historyCount`   | Samples kept in the sparkline (120 × 60s ≈ 2 h)     | `120`   |
-| `chartTopGB`     | Top of the sparkline's y-axis (GB)                  | `8.0`   |
+| Key              | Meaning                                                      | Default  |
+| ---------------- | ------------------------------------------------------------ | -------- |
+| `thresholdMode`  | `auto` (learned) or `manual` (fixed `manualHighGB`)          | `auto`   |
+| `manualHighGB`   | Restart threshold in manual mode (GB)                        | `5.5`    |
+| `autoMarginGB`   | Auto threshold = baseline + this (GB)                        | `2.0`    |
+| `autoFloorGB`    | Lower clamp for the auto threshold (GB)                      | `4.5`    |
+| `autoCeilGB`     | Upper clamp for the auto threshold (GB)                      | `12.0`   |
+| `defaultHighGB`  | Threshold used until a baseline exists (GB)                  | `5.5`    |
+| `sustainMinutes` | Minutes Edge must stay ≥ threshold before alerting           | `10`     |
+| `triggerHour`    | Hour of the daily prompt (0–23)                              | `8`      |
+| `triggerMinute`  | Minute of the daily prompt                                   | `0`      |
+| `pollSeconds`    | How often to sample Edge memory                              | `60`     |
+| `notifyCooldown` | Min seconds between high-memory notifications                | `3600`   |
+| `historyCount`   | Samples shown in the sparkline (120 × 60s ≈ 2 h)             | `120`    |
+| `chartTopGB`     | Top of the sparkline's y-axis (GB)                           | `8.0`    |
+| `calibrationSamples` | Samples before the baseline is trusted (~1 min each)     | `60`     |
+| `maxStoredSamples`   | Rolling cap on persisted samples (~3.5 days)             | `5000`   |
 
 Examples:
 
 ```bash
-defaults write com.edgerecycler.app highGB         -float 6.0
+defaults write com.edgerecycler.app thresholdMode  -string manual
+defaults write com.edgerecycler.app manualHighGB   -float 6.0
 defaults write com.edgerecycler.app sustainMinutes -int   15
-defaults write com.edgerecycler.app triggerHour    -int   7
 # then restart the app (or log out/in):
 launchctl kickstart -k "gui/$(id -u)/com.edgerecycler.agent"
 ```
 
-The thresholds above are calibrated for a 16 GB machine. If you have more RAM,
-raise `warnGB`/`highGB` accordingly. Raise `sustainMinutes` if you want the app
-to tolerate longer high-memory stretches before nudging you.
+Defaults are tuned for a 16 GB machine. On more RAM, raise `autoCeilGB` /
+`manualHighGB`. Raise `sustainMinutes` to tolerate longer high-memory stretches
+before nudging you.
 
 > **Two identifiers, on purpose:** the app's **bundle ID** is
 > `com.edgerecycler.app` (this is the `defaults` domain and what macOS keys
