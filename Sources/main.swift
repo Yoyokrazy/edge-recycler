@@ -202,6 +202,11 @@ final class SparklineView: NSView {
 
     override var intrinsicContentSize: NSSize { NSSize(width: 240, height: 72) }
 
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        needsDisplay = true   // redraw when the menu stretches us to fill its width
+    }
+
     private func label(_ text: String, _ x: CGFloat, _ y: CGFloat, align: NSTextAlignment = .left, color: NSColor = .tertiaryLabelColor) {
         let p = NSMutableParagraphStyle(); p.alignment = align
         let attrs: [NSAttributedString.Key: Any] = [
@@ -452,6 +457,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
 
         let chartItem = NSMenuItem()
         sparkline.frame = NSRect(x: 0, y: 0, width: 240, height: 72)
+        // Let the menu stretch the chart to fill the full content width it
+        // computes (including the trailing column it reserves for submenu
+        // chevrons), rather than us estimating text widths.
+        sparkline.autoresizingMask = [.width]
         chartItem.view = sparkline
         menu.addItem(chartItem)
 
@@ -514,28 +523,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         rebuildConfigMenus()
         refreshNotifyItem()
         refreshUI()
-        resizeChartToMenu()
-    }
-
-    /// Widen the chart to match the widest text item so it fills the menu's
-    /// horizontal space (menus size to their widest item; a custom view narrower
-    /// than the text items leaves an empty gap on the right).
-    func resizeChartToMenu() {
-        let font = NSFont.menuFont(ofSize: 0)
-        var maxW: CGFloat = 240
-        for it in menu.items {
-            if it.view != nil || it.isSeparatorItem { continue }
-            let tw: CGFloat
-            if let a = it.attributedTitle, a.length > 0 { tw = ceil(a.size().width) }
-            else { tw = ceil((it.title as NSString).size(withAttributes: [.font: font]).width) }
-            var total = tw + 44                       // left indent + margins
-            if it.submenu != nil { total += 14 }      // disclosure arrow
-            maxW = max(maxW, total)
-        }
-        maxW = min(maxW, 460)
-        if abs(sparkline.frame.width - maxW) > 0.5 {
-            sparkline.frame = NSRect(x: 0, y: 0, width: maxW, height: 72)
-        }
     }
 
     // ---- config submenus -------------------------------------------------
@@ -772,7 +759,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         rebuildConfigMenus()
         refreshUI()
         refreshNotifyItem()
-        resizeChartToMenu()
     }
 
     func menuDidClose(_ menu: NSMenu) {
