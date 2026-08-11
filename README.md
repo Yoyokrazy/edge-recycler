@@ -27,8 +27,10 @@ that automatic and safe, without you losing your tabs.
   Activity Monitor's *Memory* column shows), a **sparkline of recent history**,
   a color status (🟢 Healthy / 🟠 Heavy / 🔴 Restart recommended), process count,
   and system load.
-- **At-a-glance bar.** The menu-bar icon stays quiet when healthy; it shows the
-  GB number when memory is elevated and turns into a red ⚠️ when it's high.
+- **At-a-glance bar.** The menu-bar icon always reflects state as a colored
+  shape — 🟢 green circle (healthy), 🟡 yellow triangle (heavy), 🔴 red square
+  (restart recommended) — and shows the GB number alongside it when memory is
+  elevated.
 - **Manual recycle.** *Recycle Edge Now* quits and reopens Edge on demand.
 - **Daily prompt.** At **8:00 AM** (or the soonest the Mac is awake after that,
   and only while Edge is running) it asks: **Restart Now / Delay 1 Hour / Skip

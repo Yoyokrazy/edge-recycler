@@ -376,30 +376,26 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
     func updateBarButton(_ st: MemState, gb: Double) {
         guard let button = statusItem.button else { return }
         let symbol: String
-        var palette: NSColor? = nil
+        let color: NSColor
         switch st {
-        case .green:  symbol = "arrow.triangle.2.circlepath"
-        case .yellow: symbol = "arrow.triangle.2.circlepath"
-        case .red:    symbol = "exclamationmark.triangle.fill"; palette = .systemRed
+        case .green:  symbol = "circle.fill";   color = .systemGreen
+        case .yellow: symbol = "triangle.fill"; color = .systemYellow
+        case .red:    symbol = "square.fill";   color = .systemRed
         }
-        if let base = NSImage(systemSymbolName: symbol, accessibilityDescription: "Edge Recycler") {
-            if let p = palette {
-                let cfg = NSImage.SymbolConfiguration(paletteColors: [p])
-                let img = base.withSymbolConfiguration(cfg)
-                img?.isTemplate = false
-                button.image = img
-            } else {
-                base.isTemplate = true
-                button.image = base
-            }
+        if let base = NSImage(systemSymbolName: symbol, accessibilityDescription: "Edge memory status") {
+            let cfg = NSImage.SymbolConfiguration(pointSize: 11, weight: .medium)
+                .applying(NSImage.SymbolConfiguration(paletteColors: [color]))
+            let img = base.withSymbolConfiguration(cfg)
+            img?.isTemplate = false
+            button.image = img
         } else {
             button.image = nil
-            button.title = "\u{267B}"
+            button.title = "\u{25CF}"
         }
         // show the number in the bar only when things are elevated
         button.imagePosition = .imageLeading
         button.title = (st == .green || current.mainPid == nil) ? "" :
-            String(format: " %.1fG", gb)
+            String(format: " %.1fGb", gb)
     }
 
     func menuWillOpen(_ menu: NSMenu) {
