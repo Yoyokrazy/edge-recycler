@@ -55,6 +55,11 @@ that automatic and safe, without you losing your tabs.
   spike), it posts a **native macOS notification** with a **Restart Edge Now**
   button. Rate-limited to at most once an hour. A brief spike from loading a
   heavy page won't trigger it; only genuinely stuck-high memory does.
+- **"Not Responding" (hang) detection.** Independently of memory, it watches for
+  Edge becoming unresponsive — the same **beachball / "(Not Responding)"** state
+  the Dock and Activity Monitor show — and prompts you to restart it. If a
+  graceful quit can't close a hung Edge, it offers a **Force Quit & Reopen**
+  (see [How hang detection works](#how-hang-detection-works)).
 - **Native notifications, done right.** Permission is requested **in context**
   the first time you open the menu — never at launch — so the macOS *Allow*
   prompt appears and sticks. The menu shows notification status and, if you've
@@ -205,6 +210,7 @@ parentheses:
 | `chartTopGB`     | Top of the sparkline's y-axis (GB)                           | `8.0`    |
 | `calibrationSamples` | Samples before the baseline is trusted (~1 min each)     | `60`     |
 | `maxStoredSamples`   | Rolling cap on persisted samples (~3.5 days)             | `5000`   |
+| `hangDetection`      | Detect & alert when Edge is "Not Responding" (`-bool`)  | `true`   |
 
 Examples:
 
@@ -255,7 +261,32 @@ ones whose executable path is inside `…/Microsoft Edge.app/…` (which correct
 **excludes** Microsoft Teams' embedded WebView, even though it uses the Edge
 framework), and sums each process's `ri_phys_footprint` from
 `proc_pid_rusage(RUSAGE_INFO_V2)`. That's the memory-pressure-relevant figure
-macOS itself uses, so it lines up with Activity Monitor.
+macOS itself uses, so it lines up with Activity Monitor. These are external
+kernel queries, so the readings stay accurate **even when Edge is hung** — the
+app is a separate process with its own run loop.
+
+## How hang detection works
+
+"Not Responding" is what macOS shows (beachball, red text in Activity Monitor
+and Force Quit) when an app's **main thread stops servicing its event port**
+past a timeout — a deadlock, synchronous disk/network I/O, or a synchronous IPC
+wait (the very thing that froze Edge in the incident this project came from).
+
+The app reads that exact state via the private CoreGraphics/SkyLight function
+**`CGSEventIsAppUnresponsive`** — the same signal Activity Monitor uses. It's
+resolved at runtime with `dlsym` (so a missing symbol degrades gracefully rather
+than breaking launch) and needs no special permission. To avoid false alarms:
+
+- A **freshly-launched** app reads as unresponsive until it starts pumping its
+  run loop, so hangs are ignored until the Edge process has been alive ≥ 45 s.
+- A rising "hung" reading is **re-confirmed after a few seconds** before alerting.
+- Alerts are rate-limited (same hourly cooldown as memory alerts).
+
+Because a truly hung Edge may ignore the graceful `SIGTERM` quit, if a recycle
+can't close it the app offers **Force Quit & Reopen** (`SIGKILL` then relaunch
+with session restore) — always user-confirmed, never automatic.
+
+Turn it off with `defaults write com.edgerecycler.app hangDetection -bool false`.
 
 ## Troubleshooting
 

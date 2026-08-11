@@ -53,11 +53,17 @@ enum Config {
     static var calibrationSamples: Int { intDefault("calibrationSamples", 60) } // ~1h before baseline is trusted
     static var maxStoredSamples: Int { intDefault("maxStoredSamples", 5000) }    // ~3.5 days at 60s
 
+    /// Detect and alert when Edge is "Not Responding" (hung). On by default.
+    static var hangDetection: Bool { boolDefault("hangDetection", true) }
+
     static func intDefault(_ k: String, _ d: Int) -> Int {
         UserDefaults.standard.object(forKey: k) != nil ? UserDefaults.standard.integer(forKey: k) : d
     }
     static func doubleDefault(_ k: String, _ d: Double) -> Double {
         UserDefaults.standard.object(forKey: k) != nil ? UserDefaults.standard.double(forKey: k) : d
+    }
+    static func boolDefault(_ k: String, _ d: Bool) -> Bool {
+        UserDefaults.standard.object(forKey: k) != nil ? UserDefaults.standard.bool(forKey: k) : d
     }
     static func set(_ k: String, _ v: Double) { UserDefaults.standard.set(v, forKey: k) }
     static func set(_ k: String, _ v: String) { UserDefaults.standard.set(v, forKey: k) }
@@ -141,6 +147,7 @@ struct EdgeSnapshot {
     var bytes: UInt64 = 0
     var procs: Int = 0
     var mainPid: pid_t? = nil
+    var mainStart: UInt64 = 0   // main process start time (mach abstime) — identity
     var gb: Double { Double(bytes) / 1_073_741_824.0 }
 }
 
@@ -165,9 +172,8 @@ enum Sampler {
             guard path.contains("/Microsoft Edge.app/") else { continue }
 
             // The root browser process is the bare executable, not a Helper.
-            if path.hasSuffix("/Contents/MacOS/Microsoft Edge") {
-                snap.mainPid = pid
-            }
+            let isMain = path.hasSuffix("/Contents/MacOS/Microsoft Edge")
+            if isMain { snap.mainPid = pid }
 
             var info = rusage_info_v2()
             let rc = withUnsafeMutablePointer(to: &info) { p -> Int32 in
@@ -178,9 +184,56 @@ enum Sampler {
             if rc == 0 {
                 snap.bytes += info.ri_phys_footprint
                 snap.procs += 1
+                if isMain { snap.mainStart = info.ri_proc_start_abstime }
             }
         }
         return snap
+    }
+
+    /// True if the given pid currently exists (signal 0 probes without sending).
+    static func isAlive(_ pid: pid_t) -> Bool { pid > 0 && kill(pid, 0) == 0 }
+}
+
+// MARK: - Responsiveness ("Not Responding" detection)
+
+/// Detects the same "Not Responding" state that the Dock, Activity Monitor, and
+/// Force Quit show. macOS flags an app unresponsive when its main thread stops
+/// servicing its event port past a timeout (deadlock, sync I/O, sync IPC wait).
+///
+/// We read that flag via the private CoreGraphics/SkyLight function
+/// `CGSEventIsAppUnresponsive` (what Activity Monitor uses) — resolved at runtime
+/// with dlsym so a missing symbol degrades gracefully instead of failing to
+/// launch. It has a built-in time threshold, so it won't trip on brief blips.
+enum Responsiveness {
+    private typealias MainConnFn = @convention(c) () -> Int32
+    private typealias IsUnrespFn = @convention(c) (Int32, UnsafeRawPointer) -> Bool
+    private typealias GetProcFn  = @convention(c) (pid_t, UnsafeMutableRawPointer) -> Int32
+
+    private static func global<T>(_ name: String, _ t: T.Type) -> T? {
+        guard let h = dlopen(nil, RTLD_NOW), let p = dlsym(h, name) else { return nil }
+        return unsafeBitCast(p, to: t)
+    }
+    private static func appServices<T>(_ name: String, _ t: T.Type) -> T? {
+        let h = dlopen("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices", RTLD_NOW)
+        guard let h, let p = dlsym(h, name) else { return nil }
+        return unsafeBitCast(p, to: t)
+    }
+
+    private static let mainConn = global("CGSMainConnectionID", MainConnFn.self)
+    private static let isUnresp = global("CGSEventIsAppUnresponsive", IsUnrespFn.self)
+    private static let getProc  = appServices("GetProcessForPID", GetProcFn.self)
+
+    static var available: Bool { mainConn != nil && isUnresp != nil && getProc != nil }
+
+    /// True if macOS considers the process "Not Responding"; nil if undeterminable
+    /// (API unavailable, or no Process-Manager PSN for the pid).
+    static func isNotResponding(pid: pid_t) -> Bool? {
+        guard let mainConn, let isUnresp, let getProc, pid > 0 else { return nil }
+        var psn: (UInt32, UInt32) = (0, 0)
+        return withUnsafeMutableBytes(of: &psn) { raw -> Bool? in
+            guard let base = raw.baseAddress, getProc(pid, base) == 0 else { return nil }
+            return isUnresp(mainConn(), UnsafeRawPointer(base))
+        }
     }
 }
 
@@ -311,8 +364,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
     var current = EdgeSnapshot()
     var lastRecycled: Date?
     var lastNotified: Date?
+    var lastHangNotified: Date?
     var notificationPending = false  // guards against duplicate in-flight notifications
     var redSince: Date?           // when Edge first went (and stayed) at/above the threshold
+    var isHung = false            // Edge is currently "Not Responding"
+    var hangConfirmScheduled = false  // a rising-edge confirm is already pending
+    var edgeMainPid: pid_t = 0    // last-seen Edge browser pid (to detect restarts)
+    var edgeMainStart: UInt64 = 0 // …and its start time, so PID reuse is detected
+    var edgeFirstSeen = Date()    // when the current Edge process was first observed
     var isPrompting = false
     var isRecycling = false
     var didRequestAuth = false    // request notification permission only once, in-context
@@ -392,6 +451,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
 
     func applicationDidFinishLaunching(_ note: Notification) {
         Store.shared.load()
+        diag("hang detection available: \(Responsiveness.available)")
         buildMenu()
         setupNotifications()
         seedInitialFireDayIfNeeded()
@@ -651,17 +711,25 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
 
     func refreshUI() {
         let gb = current.gb
-        let st = state(gb)
-        let word = (st == .red) ? "Restart recommended" : (st == .yellow ? "Heavy" : "Healthy")
+        let memState = state(gb)
+        // A hang is the most urgent state — surface it as red regardless of memory.
+        let hung = isHung && current.mainPid != nil
+        let st: MemState = hung ? .red : memState
+        let word = (memState == .red) ? "Restart recommended" : (memState == .yellow ? "Heavy" : "Healthy")
         let color: NSColor = (st == .red) ? .systemRed : (st == .yellow ? .systemOrange : .systemGreen)
 
         // header with colored status dot
         let head = NSMutableAttributedString()
         head.append(NSAttributedString(string: "\u{25CF} ",
             attributes: [.foregroundColor: color, .font: NSFont.systemFont(ofSize: 12)]))
-        let title = current.mainPid == nil
-            ? "Edge not running"
-            : String(format: "Edge memory: %.2f GB \u{2014} %@", gb, word)
+        let title: String
+        if current.mainPid == nil {
+            title = "Edge not running"
+        } else if hung {
+            title = String(format: "Edge isn\u{2019}t responding \u{2014} %.1f GB", gb)
+        } else {
+            title = String(format: "Edge memory: %.2f GB \u{2014} %@", gb, word)
+        }
         head.append(NSAttributedString(string: title,
             attributes: [.font: NSFont.menuFont(ofSize: 13),
                          .foregroundColor: NSColor.labelColor]))
@@ -758,6 +826,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
     func menuNeedsUpdate(_ menu: NSMenu) {
         sampleNow()   // make sure the dropdown shows a fresh reading
         updateStreak()
+        checkResponsiveness()
         rebuildConfigMenus()
         refreshUI()
         refreshNotifyItem()
@@ -806,9 +875,68 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         // Edge memory is transitional and would skew the learned baseline.
         if current.mainPid != nil && !isRecycling { Store.shared.append(gb: current.gb) }
         updateStreak()   // after append, so it uses the freshly-updated threshold
+        checkResponsiveness()
         refreshUI()
         checkHighMemory()
         checkSchedule()
+    }
+
+    /// Detect Edge's "Not Responding" state and, on a confirmed hang, prompt to
+    /// restart. Guards against false positives: a freshly-launched app reads as
+    /// unresponsive until it starts pumping its run loop, so we ignore hangs until
+    /// the Edge process has been alive a while, and we re-confirm rising edges
+    /// after a short delay. Process identity is (pid, start time) so a reused PID
+    /// isn't mistaken for the old, already-settled process.
+    func checkResponsiveness() {
+        guard Config.hangDetection, !isRecycling, let pid = current.mainPid else {
+            // Edge disabled/absent → clear hang and re-arm the settle gate so a
+            // returning Edge (even with a reused PID) gets the cold-start grace.
+            if isHung { isHung = false }
+            edgeMainPid = 0; edgeMainStart = 0; hangConfirmScheduled = false
+            return
+        }
+        if pid != edgeMainPid || current.mainStart != edgeMainStart {
+            edgeMainPid = pid; edgeMainStart = current.mainStart
+            edgeFirstSeen = Date(); isHung = false; hangConfirmScheduled = false
+        }
+        guard Date().timeIntervalSince(edgeFirstSeen) >= 45 else { return }  // ignore cold-start
+
+        switch Responsiveness.isNotResponding(pid: pid) {
+        case .some(true):
+            if isHung {
+                maybeNotifyHang()                 // still hung — renotify per cooldown
+            } else if !hangConfirmScheduled {
+                hangConfirmScheduled = true
+                let confirmPid = pid
+                let confirmStart = current.mainStart
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                    self.hangConfirmScheduled = false
+                    guard !self.isRecycling, self.current.mainPid == confirmPid,
+                          self.current.mainStart == confirmStart,
+                          Responsiveness.isNotResponding(pid: confirmPid) == .some(true) else { return }
+                    self.isHung = true
+                    self.refreshUI()
+                    self.maybeNotifyHang()
+                }
+            }
+        case .some(false):
+            isHung = false                        // definitely responsive → clear
+        case .none:
+            break                                 // indeterminate → preserve current state
+        }
+    }
+
+    func maybeNotifyHang() {
+        let now = Date()
+        if let last = lastHangNotified, now.timeIntervalSince(last) < Config.notifyCooldown { return }
+        if notificationPending { return }
+        notificationPending = true
+        notify(title: "Edge isn\u{2019}t responding",
+               body: "Edge has stopped responding. Restart it? Your tabs will reopen.",
+               offerRecycle: true) { ok in
+            self.notificationPending = false
+            if ok { self.lastHangNotified = Date() }
+        }
     }
 
     func checkHighMemory() {
@@ -895,45 +1023,122 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         refreshUI()
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let snap = Sampler.snapshot()
-            if let pid = snap.mainPid {
-                kill(pid, SIGTERM)
+            // Capture the specific process we intend to end, by identity, so we
+            // never signal or "wait out" a *different* Edge that started meanwhile.
+            let target = Sampler.snapshot().mainPid
+            if let pid = target {
+                kill(pid, SIGTERM)   // graceful — lets Edge save its session
                 var exited = false
                 for _ in 0..<25 {
-                    if Sampler.snapshot().mainPid == nil { exited = true; break }
+                    if !Sampler.isAlive(pid) { exited = true; break }   // wait on THIS pid
                     Thread.sleep(forTimeInterval: 1)
                 }
                 if !exited {
                     DispatchQueue.main.async {
                         self.isRecycling = false
                         self.refreshUI()
-                        self.showBusyAlert()
+                        self.showBusyAlert(targetPid: pid)   // offer Force Quit for this pid
                     }
                     return
                 }
                 Thread.sleep(forTimeInterval: 2)
             }
 
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            p.arguments = ["-a", "Microsoft Edge", "--args", "--restore-last-session"]
-            try? p.run(); p.waitUntilExit()
+            let launched = self.launchEdge()
 
             DispatchQueue.main.async {
-                self.lastRecycled = Date()
                 self.isRecycling = false
-                self.redSince = nil          // fresh Edge — start the streak clock over
-                self.history.removeAll()
+                if launched {
+                    self.lastRecycled = Date()
+                    self.isHung = false          // fresh Edge is responsive again
+                    self.redSince = nil          // fresh Edge — start the streak clock over
+                    self.edgeMainPid = 0; self.edgeMainStart = 0   // re-arm settle gate
+                    self.history.removeAll()
+                }
                 self.sampleNow()
+                self.updateStreak()
                 self.refreshUI()
+                if !launched {
+                    self.showFailedAlert("Couldn\u{2019}t reopen Edge",
+                        "Edge was closed but didn\u{2019}t come back. Open it manually from Applications.")
+                }
             }
         }
     }
 
-    func showBusyAlert() {
+    /// Relaunch Edge with session restore; returns true only once an Edge main
+    /// process is actually observed (so we never falsely report success).
+    func launchEdge() -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        p.arguments = ["-a", "Microsoft Edge", "--args", "--restore-last-session"]
+        do { try p.run() } catch { return false }
+        p.waitUntilExit()
+        if p.terminationStatus != 0 { return false }   // `open` couldn't find/launch it
+        for _ in 0..<20 {                              // confirm a process appears (≤10s)
+            if Sampler.snapshot().mainPid != nil { return true }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        return false
+    }
+
+    func showBusyAlert(targetPid: pid_t) {
+        NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert()
-        a.messageText = "Couldn't close Edge"
-        a.informativeText = "Edge didn't quit within 25 seconds \u{2014} a page may be showing a \u{201C}Leave site?\u{201D} prompt. Nothing was forced; try again in a moment."
+        a.messageText = "Couldn\u{2019}t close Edge"
+        a.informativeText = "Edge didn\u{2019}t quit within 25 seconds \u{2014} it may be unresponsive, or a page may be showing a \u{201C}Leave site?\u{201D} prompt.\n\nForce Quit will end it immediately and reopen it with your tabs. Unsaved changes in a page could be lost."
+        a.addButton(withTitle: "Force Quit & Reopen")
+        a.addButton(withTitle: "Cancel")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        // Only force-quit if that exact process is still around; otherwise it
+        // already exited (or was replaced) — just make sure Edge is running.
+        if Sampler.isAlive(targetPid) {
+            forceQuitAndRelaunch(pid: targetPid)
+        } else if Sampler.snapshot().mainPid == nil {
+            recycleEdge()   // nothing to kill; this just relaunches
+        }
+    }
+
+    /// Force-quit one specific process (by identity) then relaunch Edge.
+    func forceQuitAndRelaunch(pid: pid_t) {
+        if isRecycling { return }
+        isRecycling = true
+        refreshUI()
+        DispatchQueue.global(qos: .userInitiated).async {
+            if Sampler.isAlive(pid) {
+                kill(pid, SIGKILL)
+                for _ in 0..<20 { if !Sampler.isAlive(pid) { break }; Thread.sleep(forTimeInterval: 0.5) }
+            }
+            if Sampler.isAlive(pid) {   // SIGKILL should never fail for our own user
+                DispatchQueue.main.async {
+                    self.isRecycling = false; self.refreshUI()
+                    self.showFailedAlert("Force Quit couldn\u{2019}t end Edge",
+                        "Edge (pid \(pid)) is still running. Use Force Quit from Activity Monitor.")
+                }
+                return
+            }
+            Thread.sleep(forTimeInterval: 1)
+            let launched = self.launchEdge()
+            DispatchQueue.main.async {
+                self.isRecycling = false
+                if launched {
+                    self.lastRecycled = Date(); self.isHung = false; self.redSince = nil
+                    self.edgeMainPid = 0; self.edgeMainStart = 0; self.history.removeAll()
+                }
+                self.sampleNow(); self.updateStreak(); self.refreshUI()
+                if !launched {
+                    self.showFailedAlert("Couldn\u{2019}t reopen Edge",
+                        "Edge was closed but didn\u{2019}t come back. Open it manually from Applications.")
+                }
+            }
+        }
+    }
+
+    func showFailedAlert(_ title: String, _ body: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = body
         a.runModal()
     }
 
