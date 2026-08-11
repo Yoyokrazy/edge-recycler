@@ -14,16 +14,17 @@ import UserNotifications
 //    history, and to "Recycle Edge Now" on demand.
 //  * Once a day at 8:00 AM (or the soonest the Mac is awake after that, and
 //    only while Edge is running) it asks: Restart Now / Delay 1 Hour / Skip.
-//  * If memory crosses the "high" threshold it posts a native notification
-//    with a "Restart Edge Now" button (rate-limited so it never spams).
+//  * If memory stays above the "high" threshold for a sustained period (not a
+//    momentary spike) it posts a native macOS notification with a "Restart Edge
+//    Now" button (rate-limited so it never spams).
 //  * Recycling = graceful SIGTERM (like Cmd-Q, so tabs are saved and there's
 //    no "didn't shut down properly" bubble) then relaunch with
 //    --restore-last-session. It NEVER force-kills.
 //
 // Tunable at runtime without recompiling, e.g.:
-//    defaults write com.milively.edge-recycler highGB   -float 6.0
-//    defaults write com.milively.edge-recycler warnGB   -float 4.0
-//    defaults write com.milively.edge-recycler triggerHour -int 8
+//    defaults write com.edgerecycler.app highGB        -float 6.0
+//    defaults write com.edgerecycler.app sustainMinutes -int 15
+//    defaults write com.edgerecycler.app triggerHour   -int 8
 // ============================================================================
 
 // MARK: - Config
@@ -34,8 +35,11 @@ enum Config {
     static var pollSeconds: Double { doubleDefault("pollSeconds", 60) }
     static var warnGB: Double { doubleDefault("warnGB", 4.0) }
     static var highGB: Double { doubleDefault("highGB", 5.5) }
+    /// How long Edge must stay continuously at/above highGB before we alert.
+    /// Filters out momentary spikes (e.g. loading a heavy page).
+    static var sustainMinutes: Double { doubleDefault("sustainMinutes", 10) }
     static var notifyCooldown: Double { doubleDefault("notifyCooldown", 3600) }
-    static var historyCount: Int { intDefault("historyCount", 60) }
+    static var historyCount: Int { intDefault("historyCount", 120) }
     static var chartTopGB: Double { doubleDefault("chartTopGB", 8.0) }
 
     static func intDefault(_ k: String, _ d: Int) -> Int {
@@ -190,19 +194,48 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
     var current = EdgeSnapshot()
     var lastRecycled: Date?
     var lastNotified: Date?
+    var redSince: Date?           // when Edge first went (and stayed) at/above highGB
     var isPrompting = false
     var isRecycling = false
+    var didRequestAuth = false    // request notification permission only once, in-context
 
     let sparkline = SparklineView()
     var headerItem = NSMenuItem()
     var contextItem = NSMenuItem()
     var recycleItem = NSMenuItem()
     var lastItem = NSMenuItem()
+    var notifyItem = NSMenuItem()
 
     var hasBundle: Bool { Bundle.main.bundleIdentifier != nil }
 
     let kLastFiredDay = "lastFiredDay"
     let kSnoozeUntil  = "snoozeUntil"
+
+    // Lightweight file logger for diagnosing notification/authorization issues.
+    func diag(_ msg: String) {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let line = "\(f.string(from: Date()))  \(msg)\n"
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/edge-recycle.diag.log")
+        if let data = line.data(using: .utf8) {
+            if let h = try? FileHandle(forWritingTo: url) {
+                h.seekToEndOfFile(); h.write(data); try? h.close()
+            } else {
+                try? data.write(to: url)
+            }
+        }
+    }
+
+    func authStatusString(_ s: UNAuthorizationStatus) -> String {
+        switch s {
+        case .notDetermined: return "notDetermined"
+        case .denied: return "denied"
+        case .authorized: return "authorized"
+        case .provisional: return "provisional"
+        case .ephemeral: return "ephemeral"
+        @unknown default: return "unknown(\(s.rawValue))"
+        }
+    }
 
     // ---- lifecycle -------------------------------------------------------
 
@@ -277,12 +310,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         test.target = self
         menu.addItem(test)
 
+        notifyItem = NSMenuItem(title: "Notifications: \u{2026}",
+                              action: #selector(notificationsMenuAction), keyEquivalent: "")
+        notifyItem.target = self
+        menu.addItem(notifyItem)
+
         let quit = NSMenuItem(title: "Quit Edge Recycler",
                               action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
 
         statusItem.menu = menu
+        refreshNotifyItem()
         refreshUI()
     }
 
@@ -366,6 +405,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
     func menuWillOpen(_ menu: NSMenu) {
         sampleNow()   // make sure the dropdown shows a fresh reading
         refreshUI()
+        refreshNotifyItem()
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        // Request notification permission the first time the user interacts with
+        // the menu — but only AFTER it closes, so we're out of the menu's modal
+        // tracking loop and the app can activate for the prompt to stick (per
+        // Apple: request in-context while active, never at launch/background).
+        requestAuthInContextIfNeeded()
     }
 
     // ---- polling + schedule ---------------------------------------------
@@ -374,9 +422,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
 
     func sampleNow() {
         current = Sampler.snapshot()
+        // Maintain the sustained-high streak here (not only in checkHighMemory),
+        // so every sample path — timer, menu open, post-recycle — keeps redSince
+        // consistent. A dropped/low sample or a missing Edge always resets it,
+        // which prevents a stale streak from firing an immediate alert.
         if current.mainPid != nil {
             history.append(current.gb)
             if history.count > Config.historyCount { history.removeFirst(history.count - Config.historyCount) }
+            if state(current.gb) == .red {
+                if redSince == nil { redSince = Date() }
+            } else {
+                redSince = nil
+            }
+        } else {
+            redSince = nil
         }
     }
 
@@ -388,12 +447,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
     }
 
     func checkHighMemory() {
-        guard current.mainPid != nil else { return }
-        guard state(current.gb) == .red else { return }
+        // redSince is maintained by sampleNow(). Alert only once Edge has been
+        // continuously at/above highGB for sustainMinutes, respecting cooldown,
+        // and only mark lastNotified when the notification actually posts.
+        guard current.mainPid != nil, let since = redSince else { return }
         let now = Date()
+        guard now.timeIntervalSince(since) >= Config.sustainMinutes * 60 else { return }
         if let last = lastNotified, now.timeIntervalSince(last) < Config.notifyCooldown { return }
-        lastNotified = now
-        postHighMemoryNotification(gb: current.gb)
+        let mins = Int(now.timeIntervalSince(since) / 60)
+        let gb = current.gb
+        postHighMemoryNotification(gb: gb, sustainedMinutes: mins) { ok in
+            if ok { self.lastNotified = Date() }   // completion is delivered on main
+        }
     }
 
     func checkSchedule() {
@@ -489,6 +554,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
             DispatchQueue.main.async {
                 self.lastRecycled = Date()
                 self.isRecycling = false
+                self.redSince = nil          // fresh Edge — start the streak clock over
                 self.history.removeAll()
                 self.sampleNow()
                 self.refreshUI()
@@ -503,10 +569,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         a.runModal()
     }
 
-    // ---- notifications ---------------------------------------------------
+    // ---- notifications (native UserNotifications) ------------------------
+    //
+    // Permission model (per Apple's "Asking permission to use notifications"):
+    //   * We NEVER call requestAuthorization at launch. A background LSUIElement
+    //     agent isn't frontmost, so the system prompt would be auto-dismissed and
+    //     permanently recorded as "denied" — after which no request ever prompts
+    //     again. That's the bug we hit originally.
+    //   * Instead we request exactly once, in-context, when the user opens the
+    //     menu (an explicit interaction) with the app activated, so the prompt
+    //     shows and sticks. Delivery then uses native Notification Center banners.
 
     func setupNotifications() {
-        guard hasBundle else { return }
+        guard hasBundle else { diag("no bundle id; notifications unavailable"); return }
         let center = UNUserNotificationCenter.current()
         center.delegate = self
         let action = UNNotificationAction(identifier: "RECYCLE",
@@ -514,43 +589,133 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         let cat = UNNotificationCategory(identifier: "EDGE_HIGH",
                         actions: [action], intentIdentifiers: [], options: [])
         center.setNotificationCategories([cat])
-        center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        center.getNotificationSettings { s in
+            self.diag("launch settings: auth=\(self.authStatusString(s.authorizationStatus))")
+        }
     }
 
-    func postHighMemoryNotification(gb: Double) {
-        if hasBundle {
-            let c = UNMutableNotificationContent()
-            c.title = "Edge is using a lot of memory"
-            c.body = String(format: "Edge is at %.1f GB. Restart to free it up?", gb)
-            c.categoryIdentifier = "EDGE_HIGH"
-            c.sound = .default
-            let req = UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil)
-            UNUserNotificationCenter.current().add(req)
-        } else {
-            fallbackNotify("Edge is using a lot of memory",
-                           String(format: "Edge is at %.1f GB. Restart to free it up?", gb))
+    /// Request permission once, in-context, while the app is active so the system
+    /// prompt actually appears and its result is recorded. All state (didRequestAuth)
+    /// is touched only on the main queue to avoid races between callers
+    /// (menuDidClose, Send Test, the Notifications item). `then` always runs on main.
+    func requestAuthInContextIfNeeded(_ then: (() -> Void)? = nil) {
+        guard hasBundle else { then?(); return }
+        DispatchQueue.main.async {
+            if self.didRequestAuth { then?(); return }   // already asked this session
+            let center = UNUserNotificationCenter.current()
+            center.getNotificationSettings { s in
+                DispatchQueue.main.async {
+                    if self.didRequestAuth { then?(); return }
+                    guard s.authorizationStatus == .notDetermined else { then?(); return }
+                    self.didRequestAuth = true
+                    NSApp.activate(ignoringOtherApps: true)
+                    center.requestAuthorization(options: [.alert, .sound]) { granted, err in
+                        self.diag("in-context requestAuthorization -> granted=\(granted) err=\(err?.localizedDescription ?? "nil")")
+                        DispatchQueue.main.async { self.refreshNotifyItem(); then?() }
+                    }
+                }
+            }
         }
+    }
+
+    /// Post a native notification if authorized. `completion(success)` is always
+    /// invoked on the main queue so callers can update state (e.g. lastNotified)
+    /// only when a notification actually posted.
+    func notify(title: String, body: String, offerRecycle: Bool, completion: ((Bool) -> Void)? = nil) {
+        guard hasBundle else { DispatchQueue.main.async { completion?(false) }; return }
+        let center = UNUserNotificationCenter.current()
+        center.getNotificationSettings { s in
+            guard s.authorizationStatus == .authorized || s.authorizationStatus == .provisional else {
+                self.diag("notify skipped: not authorized (\(self.authStatusString(s.authorizationStatus)))")
+                DispatchQueue.main.async { completion?(false) }
+                return
+            }
+            let c = UNMutableNotificationContent()
+            c.title = title
+            c.body = body
+            if offerRecycle { c.categoryIdentifier = "EDGE_HIGH" }
+            c.sound = .default
+            center.add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil)) { err in
+                if let err = err { self.diag("notify add() error: \(err.localizedDescription)") }
+                DispatchQueue.main.async { completion?(err == nil) }
+            }
+        }
+    }
+
+    func postHighMemoryNotification(gb: Double, sustainedMinutes: Int, completion: ((Bool) -> Void)? = nil) {
+        notify(title: "Edge is using a lot of memory",
+               body: String(format: "Edge has been above %.1f GB for %d min (now %.1f GB). Restart to free it up?",
+                            Config.highGB, sustainedMinutes, gb),
+               offerRecycle: true, completion: completion)
     }
 
     @objc func sendTestNotification() {
-        if hasBundle {
-            let c = UNMutableNotificationContent()
-            c.title = "Edge Recycler"
-            c.body = String(format: "Test notification. Edge is at %.2f GB right now.", current.gb)
-            c.categoryIdentifier = "EDGE_HIGH"
-            c.sound = .default
-            UNUserNotificationCenter.current().add(
-                UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
-        } else {
-            fallbackNotify("Edge Recycler", "Test notification.")
+        let gbNow = current.gb   // capture on main before going async
+        requestAuthInContextIfNeeded {
+            guard self.hasBundle else { return }
+            UNUserNotificationCenter.current().getNotificationSettings { s in
+                DispatchQueue.main.async {
+                    switch s.authorizationStatus {
+                    case .denied:
+                        self.offerOpenSettings()
+                    case .authorized, .provisional:
+                        self.notify(title: "Edge Recycler",
+                                    body: String(format: "Test notification. Edge is at %.2f GB right now.", gbNow),
+                                    offerRecycle: false)
+                    default:
+                        break   // notDetermined: the Allow prompt is up; nothing to do yet
+                    }
+                }
+            }
         }
     }
 
-    func fallbackNotify(_ title: String, _ body: String) {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        p.arguments = ["-e", "display notification \"\(body)\" with title \"\(title)\""]
-        try? p.run()
+    /// Menu item that reflects notification state and does the right thing:
+    /// request (notDetermined), open Settings (denied), or send a test (authorized).
+    @objc func notificationsMenuAction() {
+        guard hasBundle else { return }
+        UNUserNotificationCenter.current().getNotificationSettings { s in
+            DispatchQueue.main.async {
+                switch s.authorizationStatus {
+                case .notDetermined: self.requestAuthInContextIfNeeded()
+                case .denied:        self.offerOpenSettings()
+                default:             self.sendTestNotification()
+                }
+            }
+        }
+    }
+
+    func refreshNotifyItem() {
+        guard hasBundle else {
+            DispatchQueue.main.async { self.notifyItem.title = "Notifications: unavailable" }
+            return
+        }
+        UNUserNotificationCenter.current().getNotificationSettings { s in
+            let label: String
+            switch s.authorizationStatus {
+            case .authorized:    label = "Notifications: on"
+            case .provisional:   label = "Notifications: quiet (tap to enable banners)"
+            case .denied:        label = "Notifications: off \u{2014} open Settings\u{2026}"
+            case .notDetermined: label = "Enable Notifications\u{2026}"
+            default:             label = "Notifications: \u{2026}"
+            }
+            DispatchQueue.main.async { self.notifyItem.title = label }
+        }
+    }
+
+    func offerOpenSettings() {
+        let a = NSAlert()
+        a.messageText = "Notifications are turned off"
+        a.informativeText = "Edge Recycler's notifications are disabled in System Settings. Turn on \u{201C}Allow Notifications\u{201D} for Edge Recycler to get high-memory and daily restart alerts."
+        a.addButton(withTitle: "Open Notification Settings")
+        a.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        if a.runModal() == .alertFirstButtonReturn { openNotificationSettings() }
+    }
+
+    @objc func openNotificationSettings() {
+        let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension")!
+        NSWorkspace.shared.open(url)
     }
 
     // present banners even though we're an accessory app

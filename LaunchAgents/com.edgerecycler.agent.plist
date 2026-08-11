@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.milively.edge-recycler</string>
+    <string>com.edgerecycler.agent</string>
 
     <!-- Launch the menu-bar app at login. The app itself owns the daily 8 AM
          prompt, memory polling, and notifications; launchd only ensures it is

@@ -7,7 +7,7 @@
     <key>CFBundleDisplayName</key>
     <string>Edge Recycler</string>
     <key>CFBundleIdentifier</key>
-    <string>com.milively.edge-recycler</string>
+    <string>com.edgerecycler.app</string>
     <key>CFBundleExecutable</key>
     <string>EdgeRecycler</string>
     <key>CFBundlePackageType</key>

@@ -5,15 +5,17 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 APP_NAME="Edge Recycler"
-LABEL="com.milively.edge-recycler"
+LABEL="com.edgerecycler.agent"              # launchd label (login agent)
 DEST="$HOME/Applications/$APP_NAME.app"
 PLIST_SRC="LaunchAgents/$LABEL.plist"
 PLIST_DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG_OUT="$HOME/Library/Logs/edge-recycle.out.log"
 LOG_ERR="$HOME/Library/Logs/edge-recycle.err.log"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
-# 1. Build
-./build.sh
+# 1. Build (into $TMPDIR, outside any LaunchServices-scanned tree)
+APP_SRC="$(./build.sh | tail -n 1)"
+[ -d "$APP_SRC" ] || { echo "Build failed: '$APP_SRC' not found"; exit 1; }
 
 # 2. Stop any running instance / previously loaded agent
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
@@ -24,7 +26,10 @@ sleep 1
 echo "==> Installing to $DEST"
 mkdir -p "$HOME/Applications"
 rm -rf "$DEST"
-cp -R "build/$APP_NAME.app" "$DEST"
+cp -R "$APP_SRC" "$DEST"
+
+# 3a. Force the installed copy to be the canonical registration for its bundle ID.
+"$LSREGISTER" -f "$DEST" 2>/dev/null || true
 
 # 4. Generate the LaunchAgent with absolute paths (launchd does not expand ~)
 echo "==> Writing $PLIST_DEST"
@@ -40,6 +45,6 @@ launchctl bootstrap "gui/$(id -u)" "$PLIST_DEST"
 
 echo ""
 echo "Installed. Look for the recycle icon in your menu bar."
-echo "  * Click it for current Edge memory + history and 'Recycle Edge Now'."
-echo "  * You'll be asked to allow Notifications the first time - say Allow."
+echo "  * A macOS Notifications permission prompt should appear - click Allow."
+echo "  * Click the icon for current Edge memory + history and 'Recycle Edge Now'."
 echo "  * Daily prompt fires at 8:00 AM (or next wake) while Edge is running."

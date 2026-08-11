@@ -3,7 +3,7 @@
 set -euo pipefail
 
 APP_NAME="Edge Recycler"
-LABEL="com.milively.edge-recycler"
+LABEL="com.edgerecycler.agent"
 DEST="$HOME/Applications/$APP_NAME.app"
 PLIST_DEST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
