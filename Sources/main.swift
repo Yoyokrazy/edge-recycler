@@ -744,8 +744,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
             }
         }
 
-        // show the number in the bar only when things are elevated
-        if !(st == .green || current.mainPid == nil) {
+        // Always show the GB figure next to the dot while Edge is running.
+        if current.mainPid != nil {
             result.append(NSAttributedString(
                 string: String(format: "  %.1f GB", gb),
                 attributes: [.font: font, .foregroundColor: NSColor.labelColor]))
