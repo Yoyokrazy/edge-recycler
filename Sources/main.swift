@@ -152,19 +152,57 @@ struct EdgeSnapshot {
 }
 
 enum Sampler {
+    /// Bundle identifier of the Microsoft Edge (stable) browser app.
+    static let edgeBundleID = "com.microsoft.edgemac"
+
+    /// All live pids, sized from the current process count (with headroom) and
+    /// retried once. A fixed-size buffer or a transient `proc_listallpids` hiccup
+    /// could otherwise yield a short/empty list — which reads as "Edge not
+    /// running" even while Edge is very much alive.
+    private static func allPids() -> [pid_t] {
+        for _ in 0..<2 {
+            var cap = Int(proc_listallpids(nil, 0))   // current pid count (+ slack)
+            if cap <= 0 { cap = 8192 }
+            cap += 64                                 // headroom for churn between calls
+            var pids = [pid_t](repeating: 0, count: cap)
+            let n = proc_listallpids(&pids, Int32(cap * MemoryLayout<pid_t>.size))
+            if n > 0 { return Array(pids.prefix(min(Int(n), cap))) }
+        }
+        return []
+    }
+
+    /// phys_footprint + start time (mach abstime) for one pid, or nil if the
+    /// kernel query fails.
+    private static func rusage(_ pid: pid_t) -> (bytes: UInt64, start: UInt64)? {
+        var info = rusage_info_v2()
+        let rc = withUnsafeMutablePointer(to: &info) { p -> Int32 in
+            p.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { rp in
+                proc_pid_rusage(pid, RUSAGE_INFO_V2, rp)
+            }
+        }
+        return rc == 0 ? (info.ri_phys_footprint, info.ri_proc_start_abstime) : nil
+    }
+
+    /// The Edge browser's pid as macOS's Process Manager reports it — a reliable,
+    /// independent "is Edge running" signal that doesn't depend on the libproc
+    /// path scan resolving every pid. Consulted only as a fallback, so it costs
+    /// nothing on the common path.
+    static func edgeAppPid() -> pid_t? {
+        for app in NSWorkspace.shared.runningApplications
+        where app.bundleIdentifier == edgeBundleID && !app.isTerminated {
+            let pid = app.processIdentifier
+            if pid > 0 { return pid }
+        }
+        return nil
+    }
+
     /// Enumerate every process belonging to the Microsoft Edge *browser* bundle
     /// (Teams' embedded WebView lives under a different .app path and is excluded)
     /// and sum each one's phys_footprint.
     static func snapshot() -> EdgeSnapshot {
         var snap = EdgeSnapshot()
-        let maxPids = 8192
-        var pids = [pid_t](repeating: 0, count: maxPids)
-        let cnt = proc_listallpids(&pids, Int32(maxPids * MemoryLayout<pid_t>.size))
-        if cnt <= 0 { return snap }
-
         var pathBuf = [CChar](repeating: 0, count: 4096)
-        for i in 0..<Int(cnt) {
-            let pid = pids[i]
+        for pid in allPids() {
             if pid <= 0 { continue }
             let len = proc_pidpath(pid, &pathBuf, UInt32(pathBuf.count))
             if len <= 0 { continue }
@@ -175,16 +213,24 @@ enum Sampler {
             let isMain = path.hasSuffix("/Contents/MacOS/Microsoft Edge")
             if isMain { snap.mainPid = pid }
 
-            var info = rusage_info_v2()
-            let rc = withUnsafeMutablePointer(to: &info) { p -> Int32 in
-                p.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { rp in
-                    proc_pid_rusage(pid, RUSAGE_INFO_V2, rp)
-                }
-            }
-            if rc == 0 {
-                snap.bytes += info.ri_phys_footprint
+            if let r = rusage(pid) {
+                snap.bytes += r.bytes
                 snap.procs += 1
-                if isMain { snap.mainStart = info.ri_proc_start_abstime }
+                if isMain { snap.mainStart = r.start }
+            }
+        }
+
+        // Resilience: if the path scan didn't pin the main browser process but
+        // macOS still lists Edge as a running app, trust that. Guards against a
+        // transient libproc miss flipping the UI to "Edge not running" while Edge
+        // is alive. mainPid == nil here means the main process wasn't counted, so
+        // adding its footprint can't double-count.
+        if snap.mainPid == nil, let wsPid = edgeAppPid(), isAlive(wsPid) {
+            snap.mainPid = wsPid
+            if let r = rusage(wsPid) {
+                snap.mainStart = r.start
+                snap.bytes += r.bytes
+                snap.procs += 1
             }
         }
         return snap
@@ -533,6 +579,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         recycleItem.target = self
         menu.addItem(recycleItem)
 
+        let redetect = NSMenuItem(title: "Check for Edge Now",
+                                  action: #selector(redetectEdge), keyEquivalent: "")
+        redetect.target = self
+        redetect.toolTip = "Re-scan for Microsoft Edge right now. Use this if the status looks wrong or hasn\u{2019}t caught up yet."
+        menu.addItem(redetect)
+
         // Restart-threshold submenu
         let threshItem = NSMenuItem(title: "Restart when above", action: nil, keyEquivalent: "")
         threshItem.submenu = thresholdMenu
@@ -824,7 +876,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        sampleNow()   // make sure the dropdown shows a fresh reading
+        refreshReading()   // make sure the dropdown shows a fresh reading
+    }
+
+    /// Re-sample Edge and refresh everything the menu shows. Shared by the menu's
+    /// open handler and the manual "Check for Edge Now" action.
+    func refreshReading() {
+        sampleNow()
         updateStreak()
         checkResponsiveness()
         rebuildConfigMenus()
@@ -1016,6 +1074,32 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
     }
 
     @objc func quitApp() { NSApp.terminate(nil) }
+
+    /// Force an immediate, fresh detection pass (the same refresh the menu does on
+    /// open) and report what was found — a manual recovery path if a poll ever
+    /// misreads Edge's state.
+    @objc func redetectEdge() {
+        refreshReading()
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        if let pid = current.mainPid {
+            a.messageText = "Edge detected"
+            if current.procs > 0 {
+                a.informativeText = String(format:
+                    "Microsoft Edge is running (pid %d), using %.2f GB across %d process%@.",
+                    pid, current.gb, current.procs, current.procs == 1 ? "" : "es")
+            } else {
+                a.informativeText = String(format:
+                    "Microsoft Edge is running (pid %d). Memory usage will refresh on the next check.", pid)
+            }
+        } else {
+            a.messageText = "Edge not detected"
+            a.informativeText = String(format:
+                "Microsoft Edge doesn\u{2019}t appear to be running right now. If it is open, wait a moment and try again \u{2014} the next automatic check runs within %d seconds.",
+                Int(Config.pollSeconds))
+        }
+        a.runModal()
+    }
 
     func recycleEdge() {
         if isRecycling { return }

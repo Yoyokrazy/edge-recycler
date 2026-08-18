@@ -30,6 +30,10 @@ makes that automatic and safe, without losing your tabs.
   confirm **Force Quit & Reopen** for a truly stuck Edge.
 - **Configurable from the menu** — *Restart when above ▸*, *Sustained for ▸*, and
   *Recalibrate Baseline…*.
+- **Resilient detection.** Edge is found by scanning the process tree; if a scan
+  momentarily misses the main process, detection falls back to macOS's running-apps
+  list, so a transient hiccup won't wrongly show *Edge not running*. *Check for Edge
+  Now* forces an immediate re-scan and reports what it finds.
 
 ## Install
 
@@ -89,7 +93,10 @@ Defaults suit a 16 GB Mac; on more RAM raise `autoCeilGB` / `manualHighGB`.
 - **Memory:** sums `ri_phys_footprint` across the Edge process tree via
   `proc_pid_rusage` — the same figure Activity Monitor shows, and an external
   kernel query, so it stays accurate **even when Edge is hung**. (Teams' embedded
-  Edge WebView is correctly excluded.)
+  Edge WebView is correctly excluded.) The process list is sized to the live pid
+  count and retried once; if that scan still misses the main process, detection
+  falls back to macOS's running-apps list (`NSWorkspace`, bundle
+  `com.microsoft.edgemac`) so a transient miss never reads as *Edge not running*.
 - **Baseline:** each poll is appended to `~/Library/Application
   Support/EdgeRecycler/state.json` (rolling window); the threshold tracks the
   median. The chart's dashed-red line is the threshold, dotted-gray is the
@@ -115,6 +122,9 @@ Defaults suit a 16 GB Mac; on more RAM raise `autoCeilGB` / `manualHighGB`.
   logged to `~/Library/Logs/edge-recycle.diag.log`.
 - **"Couldn't close Edge"?** A page had a "Leave site?" prompt blocking the quit —
   handle it and recycle again, or use Force Quit.
+- **Says "Edge not running" but it is?** Click **Check for Edge Now** to force an
+  immediate re-scan. Detection also cross-checks macOS's running-apps list, so
+  transient misses self-correct on the next poll (within `pollSeconds`).
 
 ## License
 
