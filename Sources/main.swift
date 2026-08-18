@@ -122,11 +122,7 @@ final class Store {
 
     /// Median GB across stored samples, or nil if we don't yet have `min` of them.
     func baseline(min: Int) -> Double? {
-        let need = Swift.max(min, 1)          // never index into an empty array
-        guard samples.count >= need else { return nil }
-        let v = samples.map { $0.gb }.sorted()
-        let m = v.count / 2
-        return v.count % 2 == 0 ? (v[m - 1] + v[m]) / 2 : v[m]
+        Stats.median(samples.map { $0.gb }, minCount: min)
     }
 
     /// Discard learned history so the baseline is re-learned from scratch.
@@ -139,7 +135,7 @@ final class Store {
     var calibrated: Bool { samples.count >= Config.calibrationSamples }
 }
 
-enum MemState { case green, yellow, red }
+// MemState + threshold/stats helpers live in EdgeRecyclerCore.swift (testable).
 
 // MARK: - Process / memory sampling (libproc)
 
@@ -443,20 +439,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
     /// The GB level at which a sustained stay triggers a restart prompt.
     /// Auto = baseline + margin (clamped); until a baseline exists, a safe default.
     /// Always returns a finite, sanely-bounded value regardless of defaults input.
+    /// (See `Thresholds.resolvedHighGB` for the exact, unit-tested rules.)
     var effectiveHigh: Double {
-        let raw: Double
-        if Config.thresholdMode == "manual" {
-            raw = Config.manualHighGB
-        } else if let b = baseline {
-            raw = min(max(b + Config.autoMarginGB, Config.autoFloorGB), Config.autoCeilGB)
-        } else {
-            raw = Config.defaultHighGB
-        }
-        guard raw.isFinite, raw > 0 else { return 5.5 }   // bulletproof fallback
-        return min(max(raw, 1.0), 64.0)
+        Thresholds.resolvedHighGB(mode: Config.thresholdMode,
+                                  manualHighGB: Config.manualHighGB,
+                                  baseline: baseline,
+                                  autoMarginGB: Config.autoMarginGB,
+                                  autoFloorGB: Config.autoFloorGB,
+                                  autoCeilGB: Config.autoCeilGB,
+                                  defaultHighGB: Config.defaultHighGB)
     }
     /// Yellow "heavy" level, guaranteed strictly below the restart threshold.
-    var effectiveWarn: Double { min(max(effectiveHigh - 1.0, 3.0), effectiveHigh - 0.1) }
+    var effectiveWarn: Double { Thresholds.warnGB(high: effectiveHigh) }
 
     /// The chart's x-axis span. Always covers at least the sustained-restart
     /// duration (with headroom) so you can see the whole "about to be nagged"
@@ -758,7 +752,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
     }
 
     func state(_ gb: Double) -> MemState {
-        gb >= effectiveHigh ? .red : (gb >= effectiveWarn ? .yellow : .green)
+        Thresholds.memState(gb: gb, warn: effectiveWarn, high: effectiveHigh)
     }
 
     func refreshUI() {

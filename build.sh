@@ -26,7 +26,7 @@ echo "==> Compiling" >&2
 swiftc -O -swift-version 5 \
     -framework AppKit -framework UserNotifications \
     -o "$APP/Contents/MacOS/EdgeRecycler" \
-    Sources/main.swift
+    Sources/EdgeRecyclerCore.swift Sources/main.swift
 
 echo "==> Ad-hoc code signing" >&2
 codesign --force --deep --sign - "$APP"
