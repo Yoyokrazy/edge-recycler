@@ -12,5 +12,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Run unit tests
+        run: ./test.sh
       - name: Build and ad-hoc sign the app
         run: ./build.sh

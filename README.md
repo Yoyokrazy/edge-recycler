@@ -57,6 +57,11 @@ Notifications prompt (it's requested on first interaction, not at launch — see
 below). The "App Background Activity" notice macOS shows is just confirming the
 login item; leave it enabled.
 
+**Tests:** the pure threshold/baseline logic lives in
+`Sources/EdgeRecyclerCore.swift` and is covered by `./test.sh` — plain `swiftc`,
+no XCTest or other dependencies. CI (`.github/workflows/build.yml`) runs the
+tests and a full build on every push and pull request.
+
 ## Configuration
 
 Read at runtime from `defaults`; the common ones also have menu controls.
