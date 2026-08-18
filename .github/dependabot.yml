@@ -1,0 +1,18 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Quarantine newly-released action versions for 7 days before opening an
+    # update PR, so a freshly-published (possibly compromised) release isn't
+    # adopted immediately. Pairs with SHA-pinning in the workflows.
+    cooldown:
+      default-days: 7
+    # Batch all action bumps into a single PR to cut review noise.
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
