@@ -22,6 +22,12 @@ makes that automatic and safe, without losing your tabs.
   high" is relative to *your* habits. Or pick a fixed GB value. Only nudges when
   Edge stays above the threshold for a sustained period (default 10 min), so
   momentary spikes don't bug you.
+- **System memory-pressure trigger.** Beyond Edge's absolute size, it watches the
+  Mac's own **memory-pressure** signal (and swap growth) and — when the system is
+  genuinely low on memory *and Edge is the dominant user* — recommends a restart
+  even if the GB threshold hasn't been crossed. This is the signal that actually
+  precedes the swap-thrash and UI hangs, and it won't nag you when some *other*
+  app is the memory hog.
 - **Hang detection.** Independently watches for Edge becoming **"Not
   Responding"** (the beachball state) and prompts to restart.
 - **Recycle** — on demand (*Recycle Edge Now*), on a **daily 8 AM** prompt, or
@@ -80,6 +86,9 @@ Read at runtime from `defaults`; the common ones also have menu controls.
 | `calibrationSamples` | Samples before the baseline is trusted           | `60`     |
 | `maxStoredSamples`   | Rolling cap on persisted samples (~3.5 days)     | `5000`   |
 | `hangDetection`  | Detect & alert when Edge is "Not Responding" (`-bool`)| `true`  |
+| `pressureTrigger`| Also restart on system memory pressure when Edge dominates (`-bool`) | `true` |
+| `culpritSharePct`| Edge must be ≥ this % of RAM to be blamed for pressure | `35`   |
+| `swapGrowthMB`   | Swap growth over the window that counts as "paging" (MB) | `512`  |
 
 ```bash
 defaults write com.edgerecycler.app manualHighGB -float 6.0
@@ -96,12 +105,25 @@ Defaults suit a 16 GB Mac; on more RAM raise `autoCeilGB` / `manualHighGB`.
 ## How it works
 
 - **Memory:** sums `ri_phys_footprint` across the Edge process tree via
-  `proc_pid_rusage` — the same figure Activity Monitor shows, and an external
+  `proc_pid_rusage` — the *committed* memory figure macOS charges each process,
+  matching Activity Monitor's per-process **Memory** column, via an external
   kernel query, so it stays accurate **even when Edge is hung**. (Teams' embedded
-  Edge WebView is correctly excluded.) The process list is sized to the live pid
+  Edge WebView is correctly excluded.) Note this is a **committed** total: it
+  counts compressed and swapped-out pages and charges shared regions to each
+  process, so summed across Edge's 40-plus processes it can read higher than
+  Edge's live resident RAM — and even above installed RAM. It's the right signal
+  for *swap pressure* (which is what hurts), but it's **not** a de-duplicated
+  "physical RAM used" number, so the menu labels it *committed* and clamps the
+  "% of your RAM" readout at 100%. The process list is sized to the live pid
   count and retried once; if that scan still misses the main process, detection
   falls back to macOS's running-apps list (`NSWorkspace`, bundle
   `com.microsoft.edgemac`) so a transient miss never reads as *Edge not running*.
+- **Memory pressure:** independently reads the kernel's
+  `kern.memorystatus_vm_pressure_level` (normal / warn / critical) and swap usage
+  (`vm.swapusage`). When the Mac is under real pressure — or swap is actively
+  growing — *and* Edge is at least `culpritSharePct` of RAM, a restart is
+  recommended even below the GB threshold. Both readings are plain, unprivileged
+  sysctls (an unentitled login item can't `task_for_pid` other apps).
 - **Baseline:** each poll is appended to `~/Library/Application
   Support/EdgeRecycler/state.json` (rolling window); the threshold tracks the
   median. The chart's dashed-red line is the threshold, dotted-gray is the

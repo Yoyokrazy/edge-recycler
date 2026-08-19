@@ -28,6 +28,9 @@ struct CoreTests {
         testWarnGB()
         testMemState()
         testMedian()
+        testPressure()
+        testRamSharePercent()
+        testEdgeIsSystemCulprit()
 
         let passed = checks - failures
         print("\n\(passed)/\(checks) checks passed")
@@ -104,5 +107,61 @@ struct CoreTests {
         eq(Stats.median([1, 2, 3, 4])!, 2.5, "even count averages the middle two")
         check(Stats.median([1, 2], minCount: 3) == nil, "below minCount → nil")
         eq(Stats.median([1, 2, 3], minCount: 3)!, 2.0, "exactly minCount → value")
+    }
+
+    // MARK: pressure
+
+    static func testPressure() {
+        print("pressure")
+        check(SystemHealth.pressure(fromRaw: 4) == .critical, "raw 4 → critical")
+        check(SystemHealth.pressure(fromRaw: 2) == .warn,     "raw 2 → warn")
+        check(SystemHealth.pressure(fromRaw: 1) == .normal,   "raw 1 → normal")
+        // Unknown / unexpected values fail safe to normal (never nag on garbage).
+        check(SystemHealth.pressure(fromRaw: 0) == .normal,   "raw 0 → normal")
+        check(SystemHealth.pressure(fromRaw: 3) == .normal,   "raw 3 → normal")
+        check(SystemHealth.pressure(fromRaw: 99) == .normal,  "raw 99 → normal")
+    }
+
+    // MARK: ramSharePercent
+
+    static func testRamSharePercent() {
+        print("ramSharePercent")
+        let total = 16.0 * 1_073_741_824.0
+        check(SystemHealth.ramSharePercent(usedBytes: 8.0 * 1_073_741_824.0, totalBytes: total) == 50,
+              "8/16 GB → 50%")
+        // Committed memory can exceed installed RAM — must clamp, never show >100.
+        check(SystemHealth.ramSharePercent(usedBytes: 19.0 * 1_073_741_824.0, totalBytes: total) == 100,
+              "19/16 GB clamps to 100%")
+        check(SystemHealth.ramSharePercent(usedBytes: total, totalBytes: total) == 100, "exactly full → 100%")
+        // Degenerate inputs → 0 (no divide-by-zero, no negatives, no NaN).
+        check(SystemHealth.ramSharePercent(usedBytes: 5.0, totalBytes: 0) == 0, "zero total → 0")
+        check(SystemHealth.ramSharePercent(usedBytes: 0, totalBytes: total) == 0, "zero used → 0")
+        check(SystemHealth.ramSharePercent(usedBytes: -5.0, totalBytes: total) == 0, "negative used → 0")
+        check(SystemHealth.ramSharePercent(usedBytes: .nan, totalBytes: total) == 0, "NaN used → 0")
+    }
+
+    // MARK: edgeIsSystemCulprit
+
+    static func testEdgeIsSystemCulprit() {
+        print("edgeIsSystemCulprit")
+        let floor = 512.0 * 1_048_576.0   // 512 MB
+        func culprit(_ p: MemPressure, swap: Double = 0, share: Double = 0.5,
+                     minShare: Double = 0.35, swapFloor: Double = floor) -> Bool {
+            SystemHealth.edgeIsSystemCulprit(pressure: p, swapGrewBytes: swap, edgeShare: share,
+                                             minEdgeShare: minShare, swapGrowthFloor: swapFloor)
+        }
+        // Below the culprit share → never blamed, even under critical pressure.
+        check(culprit(.critical, share: 0.20) == false, "small Edge share → not culprit even if critical")
+        check(culprit(.warn, share: 0.34, minShare: 0.35) == false, "just under min share → not culprit")
+        // Kernel pressure with a dominant Edge → culprit.
+        check(culprit(.critical) == true, "critical + dominant Edge → culprit")
+        check(culprit(.warn) == true,     "warn + dominant Edge → culprit")
+        check(culprit(.warn, share: 0.35, minShare: 0.35) == true, "share exactly at min → culprit")
+        // Normal pressure but actively paging (swap grew past the floor) → culprit.
+        check(culprit(.normal, swap: floor) == true, "normal + swap grew ≥ floor → culprit")
+        check(culprit(.normal, swap: floor - 1) == false, "normal + swap grew < floor → not culprit")
+        check(culprit(.normal, swap: 0) == false, "normal + no swap growth → not culprit")
+        // A zero/disabled swap floor must not fire on zero growth.
+        check(culprit(.normal, swap: 0, swapFloor: 0) == false, "normal + zero floor → not culprit")
     }
 }
