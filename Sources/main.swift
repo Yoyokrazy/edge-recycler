@@ -56,6 +56,18 @@ enum Config {
     /// Detect and alert when Edge is "Not Responding" (hung). On by default.
     static var hangDetection: Bool { boolDefault("hangDetection", true) }
 
+    // System memory-pressure trigger. In addition to Edge's absolute footprint,
+    // recommend a restart when the *Mac* is under real memory duress and Edge is
+    // the dominant memory user — the signal that most faithfully tracks the
+    // swap-thrash / hang this app exists to prevent.
+    static var pressureTrigger: Bool { boolDefault("pressureTrigger", true) }
+    /// Edge must be at least this share of installed RAM (percent) to be blamed
+    /// for system pressure, so we never nag when another app is the hog.
+    static var culpritSharePct: Double { doubleDefault("culpritSharePct", 35) }
+    /// Swap growth (MB) over the sustained window that counts as "actively
+    /// paging" even before the kernel raises its pressure level.
+    static var swapGrowthMB: Double { doubleDefault("swapGrowthMB", 512) }
+
     static func intDefault(_ k: String, _ d: Int) -> Int {
         UserDefaults.standard.object(forKey: k) != nil ? UserDefaults.standard.integer(forKey: k) : d
     }
@@ -236,6 +248,43 @@ enum Sampler {
     static func isAlive(_ pid: pid_t) -> Bool { pid > 0 && kill(pid, 0) == 0 }
 }
 
+// MARK: - System memory sampling (pressure + swap)
+
+/// A point-in-time reading of *system-wide* memory duress. Independent of Edge:
+/// the kernel's own pressure verdict plus current swap usage. This is the
+/// signal that most faithfully tracks "the Mac is about to thrash" — an absolute
+/// GB figure means little without it. `swapUsedBytes` is nil when the swap query
+/// fails, so a bad read is never mistaken for "swap is zero" (which would look
+/// like a large drop, then a large phantom rise, on the next good read).
+struct SystemSnapshot {
+    var pressure: MemPressure = .normal
+    var swapUsedBytes: UInt64? = nil
+}
+
+enum SystemSampler {
+    /// Raw `kern.memorystatus_vm_pressure_level` (1 = normal, 2 = warn,
+    /// 4 = critical). Returns 1 (normal) if the query fails, so a missing sysctl
+    /// degrades to "no pressure" rather than false alarms.
+    static func pressureRaw() -> Int32 {
+        var level: Int32 = 1
+        var size = MemoryLayout<Int32>.size
+        return sysctlbyname("kern.memorystatus_vm_pressure_level", &level, &size, nil, 0) == 0 ? level : 1
+    }
+
+    /// Bytes currently paged out to swap (`vm.swapusage`), or nil if the query
+    /// fails — callers must skip nil rather than treat it as zero.
+    static func swapUsedBytes() -> UInt64? {
+        var xsu = xsw_usage()
+        var size = MemoryLayout<xsw_usage>.size
+        return sysctlbyname("vm.swapusage", &xsu, &size, nil, 0) == 0 ? xsu.xsu_used : nil
+    }
+
+    static func snapshot() -> SystemSnapshot {
+        SystemSnapshot(pressure: SystemHealth.pressure(fromRaw: pressureRaw()),
+                       swapUsedBytes: swapUsedBytes())
+    }
+}
+
 // MARK: - Responsiveness ("Not Responding" detection)
 
 /// Detects the same "Not Responding" state that the Dock, Activity Monitor, and
@@ -404,11 +453,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
 
     var history: [(t: Double, v: Double)] = []   // timestamped in-session chart samples
     var current = EdgeSnapshot()
+    var sys = SystemSnapshot()                    // latest system pressure + swap reading
+    var swapHistory: [(t: Double, used: UInt64)] = []   // swap-growth over the window (one Edge lifetime)
+    var lastSampledEdgePid: pid_t?    // Edge identity the swap window + streaks belong to,
+                                      // so neither is ever carried across a relaunch
+    var lastSampleAt: Date?       // to detect long gaps (sleep) that break "continuous"
     var lastRecycled: Date?
     var lastNotified: Date?
     var lastHangNotified: Date?
     var notificationPending = false  // guards against duplicate in-flight notifications
-    var redSince: Date?           // when Edge first went (and stayed) at/above the threshold
+    // Two independent "restart-worthy" streaks so a notification never conflates
+    // causes (5 min of absolute-high + 5 min of pressure ≠ 10 min of either) and
+    // its wording reports the correct, real duration.
+    var absRedSince: Date?        // Edge continuously at/above the absolute threshold
+    var sysRedSince: Date?        // system continuously under Edge-driven memory pressure
     var isHung = false            // Edge is currently "Not Responding"
     var hangConfirmScheduled = false  // a rising-edge confirm is already pending
     var edgeMainPid: pid_t = 0    // last-seen Edge browser pid (to detect restarts)
@@ -692,9 +750,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         Config.set("sustainMinutes", m); afterSustainChange()
     }
 
-    /// Threshold changed → the streak must be re-judged against the new level.
+    /// Threshold changed → the *absolute* streak must be re-judged against the
+    /// new level (and gets a fresh sustain window so fiddling with the threshold
+    /// can't instantly fire). The system-pressure streak is independent of the
+    /// GB threshold, so it's deliberately left running.
     func afterThresholdChange() {
-        redSince = nil
+        absRedSince = nil
         sampleNow()
         updateStreak()
         rebuildConfigMenus()
@@ -703,7 +764,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
 
     /// Only the sustained-duration changed → preserve any ongoing streak so an
     /// already-high Edge isn't given a fresh grace period. updateStreak() keeps
-    /// redSince when still red and clears it if Edge has since dropped/exited.
+    /// the streaks when still red and clears them if Edge has since dropped/exited.
     func afterSustainChange() {
         sampleNow()
         updateStreak()
@@ -715,7 +776,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
     /// clean slate. Shared by first-run onboarding and recalibration.
     func restartForCleanBaseline() {
         Store.shared.reset()
-        redSince = nil
+        absRedSince = nil; sysRedSince = nil
         history.removeAll()
         recycleEdge()          // async; re-samples + refreshes on completion
         rebuildConfigMenus()
@@ -755,13 +816,49 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         Thresholds.memState(gb: gb, warn: effectiveWarn, high: effectiveHigh)
     }
 
+    /// Edge's footprint as a fraction of installed RAM, in [0, 1].
+    var edgeShare: Double {
+        let total = Double(ProcessInfo.processInfo.physicalMemory)
+        guard total > 0 else { return 0 }
+        return Double(current.bytes) / total
+    }
+
+    /// Net growth of swap-used across the retained window (never negative). The
+    /// window is bounded to the sustained-restart duration and reseeded whenever
+    /// the Edge instance changes, so a rise is only ever measured within a single
+    /// Edge lifetime and stale spikes age out predictably. This is *net* swap
+    /// growth over the window — a corroborating proxy for paging, not a precise
+    /// pageout counter.
+    var swapGrewBytes: Double {
+        guard let first = swapHistory.first?.used, let last = swapHistory.last?.used else { return 0 }
+        return last > first ? Double(last - first) : 0
+    }
+
+    /// System-grounded restart signal: the Mac is under real memory duress and
+    /// Edge is the dominant memory user. Off entirely when `pressureTrigger` is
+    /// disabled or Edge isn't running. (Pure decision in `SystemHealth`.)
+    var systemCulprit: Bool {
+        guard Config.pressureTrigger, current.mainPid != nil else { return false }
+        return SystemHealth.edgeIsSystemCulprit(pressure: sys.pressure,
+                                                swapGrewBytes: swapGrewBytes,
+                                                edgeShare: edgeShare,
+                                                minEdgeShare: Config.culpritSharePct / 100.0,
+                                                swapGrowthFloor: Config.swapGrowthMB * 1_048_576.0)
+    }
+
     func refreshUI() {
         let gb = current.gb
-        let memState = state(gb)
+        let band = state(gb)
+        let culprit = systemCulprit
+        let memState: MemState = culprit ? .red : band
         // A hang is the most urgent state — surface it as red regardless of memory.
         let hung = isHung && current.mainPid != nil
         let st: MemState = hung ? .red : memState
-        let word = (memState == .red) ? "Restart recommended" : (memState == .yellow ? "Heavy" : "Healthy")
+        let word: String
+        if culprit { word = "Mac low on memory" }
+        else if band == .red { word = "Restart recommended" }
+        else if band == .yellow { word = "Heavy" }
+        else { word = "Healthy" }
         let color: NSColor = (st == .red) ? .systemRed : (st == .yellow ? .systemOrange : .systemGreen)
 
         // header with colored status dot
@@ -786,11 +883,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         if current.mainPid == nil {
             contextItem.title = totalGB > 0 ? "Your Mac has \(totalGBInt) GB of memory" : ""
         } else {
-            let pct = totalGB > 0 ? Int((gb / totalGB * 100).rounded()) : 0
-            contextItem.title = String(format: "%d Edge processes  \u{00B7}  %d%% of your %d GB of memory",
-                                       current.procs, pct, totalGBInt)
+            // Clamped share: summed committed memory can exceed installed RAM
+            // (it counts compressed + swapped pages), so never show >100%.
+            let pct = SystemHealth.ramSharePercent(usedBytes: Double(current.bytes),
+                                                   totalBytes: Double(ProcessInfo.processInfo.physicalMemory))
+            var line = String(format: "%d Edge processes  \u{00B7}  %d%% of your %d GB of memory",
+                              current.procs, pct, totalGBInt)
+            if sys.pressure != .normal {
+                line += sys.pressure == .critical ? "  \u{00B7}  memory pressure: critical"
+                                                  : "  \u{00B7}  memory pressure: warning"
+            }
+            contextItem.title = line
         }
-        contextItem.toolTip = "Edge runs one process per tab/site plus helpers (GPU, network, extensions), so the count roughly tracks how much you have open. The percentage is Edge's total memory as a share of your Mac's installed RAM."
+        contextItem.toolTip = "Edge runs one process per tab/site plus helpers (GPU, network, extensions), so the count roughly tracks how much you have open. The percentage is Edge's committed memory (which includes compressed and swapped-out pages, so the raw sum can exceed 100% and is clamped) as a share of your Mac's installed RAM. \u{201C}Memory pressure\u{201D} is the macOS signal that the whole system is running low."
 
         // Caption below the chart: threshold mode + calibration status. (The
         // timeframe and line meanings are labeled directly on the chart now.)
@@ -898,8 +1003,48 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
 
     func sampleNow() {
         current = Sampler.snapshot()
+        sys = SystemSampler.snapshot()
+        let nowDate = Date()
+        let now = nowDate.timeIntervalSince1970
+
+        // Break "continuous" across a long gap (e.g. the Mac slept): we didn't
+        // observe the interval, so we can't claim the streak held through it.
+        // Reset the streaks and the swap baseline so nothing fires on wake from a
+        // pre-sleep reading.
+        if let last = lastSampleAt {
+            let gap = nowDate.timeIntervalSince(last)
+            if gap > max(Config.pollSeconds * 3, 180) {
+                absRedSince = nil; sysRedSince = nil
+                swapHistory.removeAll()
+            }
+        }
+        lastSampleAt = nowDate
+
+        // Swap window and streaks belong to the current Edge instance only —
+        // reset them on any PID change (relaunch, crash+restart, or a manual
+        // quit/reopen that never went through our recycle) and on absent↔present
+        // transitions, so pre-restart swap growth or an old streak is never
+        // attributed to a freshly launched Edge. Keyed on PID alone (not start
+        // time) so an intermittent rusage miss can't flap a stable Edge's window.
+        if current.mainPid != lastSampledEdgePid {
+            lastSampledEdgePid = current.mainPid
+            swapHistory.removeAll()
+            absRedSince = nil; sysRedSince = nil
+        }
+        // Only record valid swap reads; a failed read must not look like 0 (which
+        // would fabricate a large drop, then a phantom rise on the next reading).
+        // On failure, drop the window so a stale pre-failure delta can't stay
+        // latched and complete a streak while reads are broken.
+        if let used = sys.swapUsedBytes {
+            swapHistory.append((now, used))
+            let swapCutoff = now - Config.sustainMinutes * 60 - Config.pollSeconds
+            swapHistory.removeAll { $0.t < swapCutoff }
+            if swapHistory.count > 2000 { swapHistory.removeFirst(swapHistory.count - 2000) }
+        } else {
+            swapHistory.removeAll()
+        }
+
         if current.mainPid != nil {
-            let now = Date().timeIntervalSince1970
             history.append((now, current.gb))
             // Keep a little more than the visible window so the line reaches the
             // left edge; drop anything older, and hard-cap count as a safety net.
@@ -909,15 +1054,24 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         }
     }
 
-    /// Evaluate the continuous "at/above threshold" streak. Must be called AFTER
-    /// any Store.append that could shift the learned threshold, so the streak is
-    /// judged against the same threshold the UI shows. A non-red or absent-Edge
-    /// sample always clears the streak, preventing a stale start time from firing.
+    /// Evaluate the two continuous "restart-worthy" streaks. Must be called AFTER
+    /// any Store.append that could shift the learned threshold, so the absolute
+    /// streak is judged against the same threshold the UI shows. Each streak is
+    /// tracked independently (absolute-high vs Edge-driven system pressure) so a
+    /// notification reports the true duration of its own cause. A non-red or
+    /// absent-Edge sample clears the relevant streak, preventing a stale start
+    /// time from firing.
     func updateStreak() {
-        if current.mainPid != nil, state(current.gb) == .red {
-            if redSince == nil { redSince = Date() }
+        let running = current.mainPid != nil
+        if running, state(current.gb) == .red {
+            if absRedSince == nil { absRedSince = Date() }
         } else {
-            redSince = nil
+            absRedSince = nil
+        }
+        if running, systemCulprit {
+            if sysRedSince == nil { sysRedSince = Date() }
+        } else {
+            sysRedSince = nil
         }
     }
 
@@ -992,18 +1146,28 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
     }
 
     func checkHighMemory() {
-        // Alert only once Edge is currently red AND has been continuously so for
+        // Alert once a restart-worthy condition has held continuously for
         // sustainMinutes, respecting the cooldown, with no notification already in
         // flight. lastNotified is set only when a notification actually posts.
-        guard current.mainPid != nil, state(current.gb) == .red, let since = redSince else { return }
+        // The two causes are tracked separately; the system-pressure case is the
+        // more urgent/specific, so it takes precedence when both qualify. Each
+        // reports its own true duration.
+        guard current.mainPid != nil else { return }
         let now = Date()
-        guard now.timeIntervalSince(since) >= Config.sustainMinutes * 60 else { return }
         if let last = lastNotified, now.timeIntervalSince(last) < Config.notifyCooldown { return }
         if notificationPending { return }
+        let sustain = Config.sustainMinutes * 60
+
+        let sysReady = sysRedSince.map { now.timeIntervalSince($0) >= sustain } ?? false
+        let absReady = absRedSince.map { now.timeIntervalSince($0) >= sustain } ?? false
+        guard sysReady || absReady else { return }
+
         notificationPending = true
-        let mins = Int(now.timeIntervalSince(since) / 60)
         let gb = current.gb
-        postHighMemoryNotification(gb: gb, sustainedMinutes: mins) { ok in
+        let pressure = sysReady
+        let since = pressure ? sysRedSince! : absRedSince!
+        let mins = Int(now.timeIntervalSince(since) / 60)
+        postHighMemoryNotification(gb: gb, sustainedMinutes: mins, pressure: pressure) { ok in
             self.notificationPending = false          // completion is delivered on main
             if ok { self.lastNotified = Date() }
         }
@@ -1129,9 +1293,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
                 if launched {
                     self.lastRecycled = Date()
                     self.isHung = false          // fresh Edge is responsive again
-                    self.redSince = nil          // fresh Edge — start the streak clock over
+                    self.absRedSince = nil; self.sysRedSince = nil   // fresh Edge — restart the streak clocks
                     self.edgeMainPid = 0; self.edgeMainStart = 0   // re-arm settle gate
-                    self.history.removeAll()
+                    self.history.removeAll(); self.swapHistory.removeAll()
                 }
                 self.sampleNow()
                 self.updateStreak()
@@ -1200,8 +1364,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
             DispatchQueue.main.async {
                 self.isRecycling = false
                 if launched {
-                    self.lastRecycled = Date(); self.isHung = false; self.redSince = nil
-                    self.edgeMainPid = 0; self.edgeMainStart = 0; self.history.removeAll()
+                    self.lastRecycled = Date(); self.isHung = false
+                    self.absRedSince = nil; self.sysRedSince = nil
+                    self.edgeMainPid = 0; self.edgeMainStart = 0
+                    self.history.removeAll(); self.swapHistory.removeAll()
                 }
                 self.sampleNow(); self.updateStreak(); self.refreshUI()
                 if !launched {
@@ -1293,11 +1459,25 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUs
         }
     }
 
-    func postHighMemoryNotification(gb: Double, sustainedMinutes: Int, completion: ((Bool) -> Void)? = nil) {
-        notify(title: "Edge is using a lot of memory",
-               body: String(format: "Edge has been above %.1f GB for %d min (now %.1f GB). Restart to free it up?",
-                            effectiveHigh, sustainedMinutes, gb),
-               offerRecycle: true, completion: completion)
+    func postHighMemoryNotification(gb: Double, sustainedMinutes: Int, pressure: Bool = false,
+                                    completion: ((Bool) -> Void)? = nil) {
+        if pressure {
+            // System-pressure path: the Mac itself is low on memory and Edge is a
+            // dominant user — lead with that, since it's the real problem. We know
+            // Edge is a large share of RAM, not that it's provably the single
+            // biggest process, so the wording stays honest.
+            let pct = SystemHealth.ramSharePercent(usedBytes: Double(current.bytes),
+                                                   totalBytes: Double(ProcessInfo.processInfo.physicalMemory))
+            notify(title: "Your Mac is low on memory",
+                   body: String(format: "Your Mac has been under memory pressure for %d min and Edge is using a lot of it (%.1f GB, %d%% of your RAM). Restart Edge to free it up?",
+                                sustainedMinutes, gb, pct),
+                   offerRecycle: true, completion: completion)
+        } else {
+            notify(title: "Edge is using a lot of memory",
+                   body: String(format: "Edge has been above %.1f GB for %d min (now %.1f GB). Restart to free it up?",
+                                effectiveHigh, sustainedMinutes, gb),
+                   offerRecycle: true, completion: completion)
+        }
     }
 
     @objc func sendTestNotification() {

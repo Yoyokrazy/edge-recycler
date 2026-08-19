@@ -53,6 +53,74 @@ enum Thresholds {
     }
 }
 
+/// macOS memory-pressure level, mirroring the kernel's
+/// `kern.memorystatus_vm_pressure_level` (raw 1 = normal, 2 = warn, 4 =
+/// critical). This is the signal that actually precedes the swap-thrash and UI
+/// hangs this app exists to prevent — the kernel raises it as free memory runs
+/// low, *before* an absolute GB number means anything on its own.
+enum MemPressure { case normal, warn, critical }
+
+/// System-wide memory-health logic. Pure and unit-tested: the app feeds in the
+/// raw kernel readings (see `SystemSampler`) and these functions decide what to
+/// show and when Edge is the thing worth restarting.
+enum SystemHealth {
+    /// Map the kernel's raw `vm_pressure_level` to a `MemPressure`. Unknown or
+    /// unexpected values are treated as `normal` (fail safe: never nag on a
+    /// value we don't understand).
+    static func pressure(fromRaw raw: Int32) -> MemPressure {
+        switch raw {
+        case 4: return .critical
+        case 2: return .warn
+        default: return .normal   // 1 (normal) or anything unexpected
+        }
+    }
+
+    /// Edge's share of installed RAM as a whole-number percent, **clamped to
+    /// `[0, 100]`**. Summed `phys_footprint` counts compressed and swapped-out
+    /// pages, so it can exceed installed RAM; without this clamp the UI could
+    /// show a nonsensical ">100% of your memory".
+    static func ramSharePercent(usedBytes: Double, totalBytes: Double) -> Int {
+        guard totalBytes > 0, usedBytes > 0 else { return 0 }
+        let pct = usedBytes / totalBytes * 100.0
+        guard pct.isFinite else { return 0 }
+        return Int(min(max(pct, 0.0), 100.0).rounded())
+    }
+
+    /// Should we recommend recycling Edge on *system* grounds — i.e. the Mac is
+    /// actually short on memory right now — rather than purely because Edge's
+    /// absolute footprint crossed a GB threshold?
+    ///
+    /// True only when the machine is under real memory duress **and** Edge is a
+    /// large enough share of RAM to plausibly be the cause, so we never nag you
+    /// to restart Edge when some *other* app is the memory hog:
+    ///
+    /// - `critical` kernel pressure → duress.
+    /// - `warn` kernel pressure → duress.
+    /// - otherwise, swap that grew by at least `swapGrowthFloor` bytes over the
+    ///   observation window → the machine is actively paging to disk even if the
+    ///   pressure level hasn't flipped yet.
+    ///
+    /// - Parameters:
+    ///   - pressure:        kernel memory-pressure level
+    ///   - swapGrewBytes:   increase in swap-used over the sustained window
+    ///   - edgeShare:       Edge footprint ÷ installed RAM, in `[0, 1]`
+    ///   - minEdgeShare:    Edge must be at least this share to be blamed
+    ///   - swapGrowthFloor: swap growth (bytes) counting as "actively paging"
+    static func edgeIsSystemCulprit(pressure: MemPressure,
+                                    swapGrewBytes: Double,
+                                    edgeShare: Double,
+                                    minEdgeShare: Double,
+                                    swapGrowthFloor: Double) -> Bool {
+        guard edgeShare >= minEdgeShare else { return false }
+        switch pressure {
+        case .critical, .warn:
+            return true
+        case .normal:
+            return swapGrewBytes >= swapGrowthFloor && swapGrowthFloor > 0
+        }
+    }
+}
+
 /// Small statistics helpers over sampled memory readings.
 enum Stats {
     /// Median of `values`, or `nil` if fewer than `minCount` (at least 1) are
